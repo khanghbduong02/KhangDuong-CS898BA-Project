@@ -22,7 +22,6 @@ Number of Images:
 
 Classes:
 
-* Null
 * Spaghetti
 * Stringing
 * Warping
@@ -36,10 +35,9 @@ Classes:
 
 ### Image Processing Techniques
 
-* HSV Color Space
 * LAB Color Space
 * CLAHE Contrast Enhancement
-* Edge Detection
+* Canny Edge Detection
 
 ## Evaluation Metrics
 
