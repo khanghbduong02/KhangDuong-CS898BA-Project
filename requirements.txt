@@ -1,0 +1,4 @@
+numpy>=1.24.0; python_version >= "3.8"
+numpy==1.21.6; python_version < "3.8"
+opencv-python>=4.8.0; python_version >= "3.8"
+opencv-python==4.7.0.72; python_version < "3.8"

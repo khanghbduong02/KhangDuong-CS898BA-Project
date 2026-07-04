@@ -50,3 +50,54 @@ Classes:
 ## Current Status
 
 Project Pitch and Scope Approval Stage.
+
+## Getting Started: Image Processing Pipeline
+
+This project compares three preprocessing tracks before object detection:
+
+* Baseline: RGB input only.
+* Method 1: RGB -> LAB -> CLAHE.
+* Method 2: RGB -> LAB -> CLAHE -> Canny edge enhancement.
+
+### 1. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Build Preprocessed Dataset Variants
+
+Run from the project root:
+
+```bash
+python preprocess_dataset.py --input-dir roboflow-data --output-dir processed-data
+```
+
+This generates:
+
+* `processed-data/baseline/`
+* `processed-data/clahe/`
+* `processed-data/clahe_canny/`
+
+Each variant includes:
+
+* `train/images`, `train/labels`
+* `valid/images`, `valid/labels`
+* `test/images`, `test/labels`
+* `data.yaml`
+
+### 3. Train and Compare Models
+
+Use each variant's `data.yaml` for YOLO and Faster R-CNN experiments. Compare:
+
+* mAP50
+* mAP50-95
+* Precision
+* Recall
+* IoU
+
+### Notes
+
+* Labels are copied unchanged from the original Roboflow dataset.
+* Canny settings are configurable in the script CLI.
+* The CLAHE + Canny method overlays edges on the CLAHE-enhanced image to keep visual context while emphasizing defect boundaries.
