@@ -1,3 +1,4 @@
 roboflow-data/
+processed-data/
 *.zip
 *.mp4
