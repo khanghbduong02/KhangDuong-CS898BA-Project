@@ -1,4 +1,6 @@
 roboflow-data/
 processed-data/
+__pycache__/
+runs/
 *.zip
 *.mp4
