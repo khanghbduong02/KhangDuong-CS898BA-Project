@@ -6,3 +6,6 @@
 | 07/03/2026 07:05 PM | inject canny edges back the image opencv | Google AI Mode | Suggest to use cv2.addWeighted() for adding edges as highlights | Use cv2.addWeighted() to add color back to output image for image preprocessing method 2 |
 | 07/03/2026 08:37 PM | TypeError: 'type' object is not subscriptable | Google AI Mode | Type hinting for older version (Python 3.7 in this case) | Use annotations from __future__ |
 | 07/05/2026 04:09 AM | Implement the YOLO26 architecture with torch | ChatGPT | Built the custom YOLO26 Torch model and added a smoke test | Created models/yolo26_torch.py and updated test.py |
+| 07/08/2026 11:47 PM | interpolation cv2 best usage | Google AI Mode | Different Operations (e.g., downscaling, upscaling, etc.) with its best interpolation method | Code for scaling training images |
+| 07/09/2026 08:10 PM | how to load train and validate dataset for pytorch | Google AI Mode | Code for DataLoader for PyTorch | Apply code for create dataset for training |
+| 07/09/2026 08:25 PM | write a complete loss function to use for yolo26 with pytorch | Claude | Code for the Loss function with explanation | Add the code into the train_yolo26.py file |
