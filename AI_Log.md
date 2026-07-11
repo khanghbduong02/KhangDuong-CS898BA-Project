@@ -9,3 +9,5 @@
 | 07/08/2026 11:47 PM | interpolation cv2 best usage | Google AI Mode | Different Operations (e.g., downscaling, upscaling, etc.) with its best interpolation method | Code for scaling training images |
 | 07/09/2026 08:10 PM | how to load train and validate dataset for pytorch | Google AI Mode | Code for DataLoader for PyTorch | Apply code for create dataset for training |
 | 07/09/2026 08:25 PM | write a complete loss function to use for yolo26 with pytorch | Claude | Code for the Loss function with explanation | Add the code into the train_yolo26.py file |
+| 07/10/2026 11:41 PM | write functions to compute per-class AP50, AP50-95, precision, and recall metrics. | ChatGPT | Added per-class AP50/AP50-95/precision/recall output and automatic class loading from data.yaml in eval_yolo26.py | Updated eval_yolo26.py and created detection_metrics.py |
+| 07/10/2026 11:53 PM | add confusion matrix background row/column for misses and false alarms | ChatGPT | Added a background label to confusion matrix so misses and false alarms are counted. | Updated confusion matrix logic and output formatting in eval pipeline. |
