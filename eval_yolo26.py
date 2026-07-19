@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cls-gain", type=float, default=None, help="Classification BCE loss multiplier; defaults to the saved checkpoint value")
     parser.add_argument("--focal-gamma", type=float, default=None, help="Classification focal-loss gamma; defaults to the saved checkpoint value")
     parser.add_argument("--reg-gain", type=float, default=None, help="Regression term multiplier; defaults to the saved checkpoint value")
+    parser.add_argument(
+        "--reg-max",
+        type=int,
+        default=None,
+        help="Box distance bins per side; defaults to the saved checkpoint value or 1 for legacy checkpoints",
+    )
     parser.add_argument("--one2many-topk", type=int, default=None, help="Task-aligned top-k for one-to-many assignment; defaults to the saved checkpoint value")
     parser.add_argument("--one2one-topk", type=int, default=None, help="Task-aligned top-k for one-to-one assignment; defaults to the saved checkpoint value")
     parser.add_argument("--conf-thresh", type=float, default=0.25, help="Confidence threshold used for precision/recall summary")
@@ -73,7 +79,7 @@ def parse_args() -> argparse.Namespace:
 def _resolve_evaluation_settings(
     checkpoint: Dict[str, object],
     args: argparse.Namespace,
-) -> Tuple[str, float, float, float, float, int, int]:
+) -> Tuple[str, float, float, float, float, int, int, int]:
     """Use explicit CLI settings first, then checkpoint settings, then legacy defaults."""
     saved_args = checkpoint.get("args", {})
     if not isinstance(saved_args, dict):
@@ -84,9 +90,10 @@ def _resolve_evaluation_settings(
     cls_gain = args.cls_gain if args.cls_gain is not None else float(saved_args.get("cls_gain", 0.5))
     focal_gamma = args.focal_gamma if args.focal_gamma is not None else float(saved_args.get("focal_gamma", 0.0))
     reg_gain = args.reg_gain if args.reg_gain is not None else float(saved_args.get("reg_gain", 1.5))
+    reg_max = args.reg_max if args.reg_max is not None else int(saved_args.get("reg_max", 1))
     one2many_topk = args.one2many_topk if args.one2many_topk is not None else int(saved_args.get("one2many_topk", 10))
     one2one_topk = args.one2one_topk if args.one2one_topk is not None else int(saved_args.get("one2one_topk", 1))
-    return scale, box_gain, cls_gain, focal_gamma, reg_gain, one2many_topk, one2one_topk
+    return scale, box_gain, cls_gain, focal_gamma, reg_gain, one2many_topk, one2one_topk, reg_max
 
 
 def _load_positive_class_weights(
@@ -151,10 +158,12 @@ def main() -> None:
                 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.serialization")
                 checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
-    scale, box_gain, cls_gain, focal_gamma, reg_gain, one2many_topk, one2one_topk = _resolve_evaluation_settings(checkpoint, args)
+    scale, box_gain, cls_gain, focal_gamma, reg_gain, one2many_topk, one2one_topk, reg_max = _resolve_evaluation_settings(checkpoint, args)
+    if reg_max <= 0:
+        raise ValueError("Resolved reg_max must be positive")
     class_positive_weights = _load_positive_class_weights(checkpoint, num_classes, device)
 
-    model = build_yolo26(nc=num_classes, scale=scale, topk=args.max_det).to(device)
+    model = build_yolo26(nc=num_classes, scale=scale, topk=args.max_det, reg_max=reg_max).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     dataset = YoloDetectionDataset(split_root, imgsz=args.imgsz, fraction=args.fraction)
@@ -176,6 +185,7 @@ def main() -> None:
         reg_gain=reg_gain,
         one2many_topk=one2many_topk,
         one2one_topk=one2one_topk,
+        reg_max=reg_max,
         class_positive_weights=class_positive_weights,
         focal_gamma=focal_gamma,
     )
@@ -184,7 +194,7 @@ def main() -> None:
     )
     print(
         f"Evaluation settings: scale={scale} box_gain={box_gain:g} cls_gain={cls_gain:g} focal_gamma={focal_gamma:g} "
-        f"reg_gain={reg_gain:g} one2many_topk={one2many_topk} one2one_topk={one2one_topk} "
+        f"reg_gain={reg_gain:g} reg_max={reg_max} one2many_topk={one2many_topk} one2one_topk={one2one_topk} "
         f"positive_class_weights=({class_weight_summary}) postprocess={args.postprocess} "
         f"nms_iou={args.nms_iou:g} nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det}"
     )
@@ -271,6 +281,7 @@ def main() -> None:
                 "cls_gain": cls_gain,
                 "focal_gamma": focal_gamma,
                 "reg_gain": reg_gain,
+                "reg_max": reg_max,
                 "one2many_topk": one2many_topk,
                 "one2one_topk": one2one_topk,
                 "positive_class_weights": class_positive_weights.detach().cpu().tolist(),

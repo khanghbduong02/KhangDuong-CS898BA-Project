@@ -17,7 +17,7 @@ from yolo_dataset_config import YoloDatasetConfig
 
 
 def training_settings(args: argparse.Namespace, num_classes: int) -> dict[str, Any]:
-    """Return every trainer setting that must remain identical across folds."""
+    """Return every one-fold setting that must remain frozen across CV folds."""
     return {
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -30,13 +30,6 @@ def training_settings(args: argparse.Namespace, num_classes: int) -> dict[str, A
         "device": args.device,
         "scale": args.scale,
         "num_classes": num_classes,
-        "box_gain": args.box_gain,
-        "cls_gain": args.cls_gain,
-        "reg_gain": args.reg_gain,
-        "reg_max": args.reg_max,
-        "one2many_topk": args.one2many_topk,
-        "one2one_topk": args.one2one_topk,
-        "focal_gamma": args.focal_gamma,
         "class_positive_weight_power": args.class_positive_weight_power,
         "balanced_sampling": args.balanced_sampling,
         "balanced_sampling_power": args.balanced_sampling_power,
@@ -51,7 +44,7 @@ def build_train_command(
 ) -> list[str]:
     command = [
         sys.executable,
-        "train_yolo26.py",
+        "train_faster_rcnn.py",
         "--data-root",
         str(fold_root),
         "--epochs",
@@ -76,20 +69,6 @@ def build_train_command(
         args.scale,
         "--num-classes",
         str(num_classes),
-        "--box-gain",
-        str(args.box_gain),
-        "--cls-gain",
-        str(args.cls_gain),
-        "--reg-gain",
-        str(args.reg_gain),
-        "--reg-max",
-        str(args.reg_max),
-        "--one2many-topk",
-        str(args.one2many_topk),
-        "--one2one-topk",
-        str(args.one2one_topk),
-        "--focal-gamma",
-        str(args.focal_gamma),
         "--class-positive-weight-power",
         str(args.class_positive_weight_power),
         "--balanced-sampling-power",
@@ -115,7 +94,9 @@ def read_checkpoint(path: Path) -> dict[str, Any]:
 
 def values_match(expected: object, actual: object) -> bool:
     if isinstance(expected, float):
-        return isinstance(actual, (int, float)) and math.isclose(float(actual), expected, rel_tol=1e-12, abs_tol=1e-12)
+        return isinstance(actual, (int, float)) and math.isclose(
+            float(actual), expected, rel_tol=1e-12, abs_tol=1e-12
+        )
     return actual == expected
 
 
@@ -138,11 +119,6 @@ def completed_run_matches(
     mismatches: list[str] = []
     for key, expected in expected_settings.items():
         actual = saved_args.get(key)
-        # Checkpoints created before distributional regression was added did
-        # not save this argument; their architecture is the direct-regression
-        # `reg_max=1` configuration.
-        if key == "reg_max" and actual is None:
-            actual = 1
         if not values_match(expected, actual):
             mismatches.append(f"{key}: expected {expected!r}, found {actual!r}")
 
@@ -167,7 +143,7 @@ def write_plan(
     settings: dict[str, Any],
 ) -> None:
     plan = {
-        "purpose": "Generic custom YOLO26 K-fold cross-validation",
+        "purpose": "Generic custom Faster R-CNN K-fold cross-validation",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "data_root": str(args.data_root),
         "run_root": str(args.run_root),
@@ -192,7 +168,7 @@ def write_plan(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train any standard fold_<n>/train+valid YOLO dataset with the custom YOLO26 model. "
+            "Train any standard fold_<n>/train+valid YOLO dataset with the local Faster R-CNN model. "
             "Folds run sequentially and share one frozen configuration."
         )
     )
@@ -211,7 +187,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Specific fold numbers; omit to discover all fold_<number> directories",
     )
-    parser.add_argument("--epochs", type=int, required=True, help="Identical maximum epoch budget for every fold")
+    parser.add_argument("--epochs", type=int, required=True, help="Identical epoch budget for every fold")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -220,14 +196,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fraction", type=float, default=1.0, help="Use only for explicitly marked smoke tests")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--scale", type=str, default="n")
-    parser.add_argument("--box-gain", type=float, default=7.5)
-    parser.add_argument("--cls-gain", type=float, default=0.5)
-    parser.add_argument("--reg-gain", type=float, default=1.5)
-    parser.add_argument("--reg-max", type=int, default=1, help="Box distance bins per side; values above 1 enable DFL")
-    parser.add_argument("--one2many-topk", type=int, default=10)
-    parser.add_argument("--one2one-topk", type=int, default=1)
-    parser.add_argument("--focal-gamma", type=float, default=0.0)
+    parser.add_argument("--scale", choices=["s", "m", "l"], default="m")
     parser.add_argument("--class-positive-weight-power", type=float, default=0.0)
     parser.add_argument("--balanced-sampling", action="store_true")
     parser.add_argument("--balanced-sampling-power", type=float, default=1.0)
@@ -247,10 +216,14 @@ def main() -> None:
 
     if args.epochs <= 0 or args.batch_size <= 0 or args.imgsz <= 0:
         raise ValueError("--epochs, --batch-size, and --imgsz must be positive")
-    if args.reg_max <= 0:
-        raise ValueError("--reg-max must be positive")
+    if args.imgsz % 64 != 0:
+        raise ValueError("--imgsz must be divisible by 64 for the P3--P6 anchor geometry")
     if args.workers < 0 or not 0.0 < args.fraction <= 1.0:
         raise ValueError("--workers must be non-negative and --fraction must be in (0, 1]")
+    if not 0.0 <= args.class_positive_weight_power <= 1.0:
+        raise ValueError("--class-positive-weight-power must be in [0, 1]")
+    if not 0.0 <= args.balanced_sampling_power <= 1.0:
+        raise ValueError("--balanced-sampling-power must be in [0, 1]")
     if not args.data_root.is_dir():
         raise FileNotFoundError(f"Data root does not exist: {args.data_root}")
 
@@ -291,7 +264,7 @@ def main() -> None:
             shutil.rmtree(run_dir)
 
         command = build_train_command(args, fold_root, run_dir, dataset_config.num_classes)
-        print(f"\n===== CUSTOM YOLO26 TRAIN FOLD {fold}/{len(folds)} =====", flush=True)
+        print(f"\n===== CUSTOM FASTER R-CNN TRAIN FOLD {position}/{len(folds)} (fold_{fold}) =====", flush=True)
         print(subprocess.list2cmdline(command), flush=True)
         if args.dry_run:
             continue
@@ -315,7 +288,7 @@ def main() -> None:
     if args.dry_run:
         print("Dry run complete; no training was started.")
     else:
-        print("All requested custom YOLO26 folds completed. Run eval_yolo26_kfold_cv.py next.")
+        print("All requested custom Faster R-CNN folds completed. Run eval_faster_rcnn_kfold_cv.py next.")
 
 
 if __name__ == "__main__":

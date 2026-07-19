@@ -131,6 +131,29 @@ def dist2bbox(distance: torch.Tensor, anchor_points: torch.Tensor, xywh: bool = 
     return torch.cat((x1y1, x2y2), dim=1)
 
 
+class DistributionIntegral(nn.Module):
+    """Convert four discrete distance distributions into expected box distances."""
+
+    def __init__(self, reg_max: int) -> None:
+        super().__init__()
+        if reg_max <= 1:
+            raise ValueError("DistributionIntegral requires reg_max greater than one")
+        self.reg_max = reg_max
+        self.register_buffer("project", torch.arange(reg_max, dtype=torch.float32), persistent=True)
+
+    def forward(self, distances: torch.Tensor) -> torch.Tensor:
+        """Return expected left/top/right/bottom distances from `(B, 4*R, A)` logits."""
+        batch_size, channels, anchors = distances.shape
+        expected_channels = 4 * self.reg_max
+        if channels != expected_channels:
+            raise ValueError(
+                f"Expected {expected_channels} distributional box channels, got {channels}"
+            )
+        probabilities = distances.view(batch_size, 4, self.reg_max, anchors).softmax(dim=2)
+        project = self.project.to(dtype=distances.dtype).view(1, 1, self.reg_max, 1)
+        return (probabilities * project).sum(dim=2)
+
+
 class Conv(nn.Module):
     default_act = nn.SiLU()
 
@@ -345,6 +368,8 @@ class Detect(nn.Module):
 
     def __init__(self, nc: int = 80, reg_max: int = 1, end2end: bool = True, ch: Tuple[int, int, int] = ()) -> None:
         super().__init__()
+        if reg_max <= 0:
+            raise ValueError("reg_max must be positive")
         self.nc = nc
         self.nl = len(ch)
         self.reg_max = reg_max
@@ -368,6 +393,7 @@ class Detect(nn.Module):
             )
             for x in ch
         )
+        self.dfl = DistributionIntegral(reg_max) if reg_max > 1 else nn.Identity()
 
         if end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
@@ -421,7 +447,8 @@ class Detect(nn.Module):
             self.strides = strides
             self.shape = shape
 
-        return dist2bbox(preds["boxes"], self.anchors.unsqueeze(0), xywh=False) * self.strides.unsqueeze(0)
+        distances = self.dfl(preds["boxes"])
+        return dist2bbox(distances, self.anchors.unsqueeze(0), xywh=False) * self.strides.unsqueeze(0)
 
     def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
         boxes, scores = preds.split((4, self.nc), dim=-1)
@@ -454,6 +481,7 @@ class YOLO26Config:
     nc: int = 3
     scale: str = "n"
     topk: int = 300
+    reg_max: int = 1
 
 
 class YOLO26(nn.Module):
@@ -500,7 +528,7 @@ class YOLO26(nn.Module):
         self.h20 = Conv(c4, c4, 3, 2)
         self.h22 = C3k2(c4 + c5, c5, n=n1, c3k=True, e=0.5, attn=True)
 
-        self.detect = Detect(nc=cfg.nc, reg_max=1, end2end=True, ch=(c3, c4, c5))
+        self.detect = Detect(nc=cfg.nc, reg_max=cfg.reg_max, end2end=True, ch=(c3, c4, c5))
         self.detect.max_det = cfg.topk
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -535,5 +563,5 @@ class YOLO26(nn.Module):
         return self.detect([x16, x19, x22])
 
 
-def build_yolo26(nc: int = 3, scale: str = "n", topk: int = 300) -> YOLO26:
-    return YOLO26(YOLO26Config(nc=nc, scale=scale, topk=topk))
+def build_yolo26(nc: int = 3, scale: str = "n", topk: int = 300, reg_max: int = 1) -> YOLO26:
+    return YOLO26(YOLO26Config(nc=nc, scale=scale, topk=topk, reg_max=reg_max))

@@ -4,7 +4,7 @@
 >
 > **Separate from the AI accountability log:** This file records engineering work and experiment evidence. `AI_Log.md` is not edited automatically.
 >
-> **Last updated:** 2026-07-19 — the fixed class-aware NMS diagnostic completed without retraining and is adopted as the standard custom evaluation decoder; 960 + NMS is the current aggregate custom configuration.
+> **Last updated:** 2026-07-19 — the older local Faster R-CNN workflow was modernized and smoke-tested; it has no reportable benchmark result, while 960 + class-aware NMS remains the best measured custom YOLO26 configuration.
 
 ## 1. Current Decision
 
@@ -14,7 +14,7 @@
 - **CLAHE+Canny is rejected:** it underperformed RGB and CLAHE across aggregate mAP, precision, recall, and all per-class AP values.
 - **Test-split report is contaminated:** the CLAHE checkpoint was evaluated once, but a later exact-hash audit found 58 image hashes shared between train and test. Treat its metrics as descriptive diagnostics, not an independent held-out generalization result; do not tune from them.
 - **Group-disjoint CV result:** fixed custom focal-plus-weight training reached mAP50 $0.0615 \pm 0.0064$, mAP50-95 $0.0180 \pm 0.0019$, precision $0.0940 \pm 0.0045$, and recall $0.0538 \pm 0.0065$ at threshold `0.25` across three folds.
-- **Next required action:** do not resume candidate loss, sampler, class-weight, augmentation, threshold, duration, resolution, or postprocessing-threshold sweeps. The fixed class-aware NMS diagnostic materially improves every aggregate mAP result without retraining, so it is now the standard custom evaluator decoder. Report 960 + NMS as the current aggregate custom configuration, then return to annotation curation, real minority-data collection, and a newly reserved external group-disjoint test set. Any future custom architecture work must be a separately designed box-regression-head change, not another export-level sweep.
+- **Next required action:** do not run another DFL, loss, sampler, class-weight, augmentation, threshold, duration, resolution, or postprocessing sweep. DFL is a valid negative controlled result. Retain 960 + class-aware NMS as the best measured custom configuration, then proceed with annotation policy, real minority-data collection, and a newly reserved external group-disjoint test set.
 - **Do not continue** image-level balanced sampling, global `cls_gain` tuning, or positive-class weight-power tuning; each was inferior overall.
 - **Exact 20% augmentation conclusion:** it improved warping AP but reduced aggregate mAP and eliminated stringing detections at the standard threshold. It is retained as a class-specific trade-off, not the overall model.
 - **Candidate five-class neutral-baseline conclusion:** epoch 25 was the validation-loss minimum, but only spaghetti had true positives at thresholds `0.25` and `0.10`. Focal loss subsequently broke this collapse; do not repeat neutral-loss, sampler, threshold, or longer-epoch sweeps.
@@ -22,6 +22,16 @@
 - **Custom-model arm:** the local YOLO26-style architecture remains randomly initialized. The separate pretrained YOLO11n reference below was authorized solely as a practical diagnostic baseline, not as a direct architecture-only comparison or a replacement for the custom arm.
 - **Candidate group-disjoint CV:** all three folds used the identical fixed focal-plus-weight configuration and detected all five classes at threshold `0.25`. The resulting metric variability is modest overall, but class-specific performance remains low and uneven.
 - **CV-fold choice:** three folds were intentional. Five folds would reduce each validation fold from about 39 to 23 warping boxes and from about 27 to 16 warping-containing groups, producing substantially noisier minority metrics while roughly doubling total 50-epoch CV training exposure.
+
+### Faster R-CNN workflow modernization (2026-07-19)
+
+The previously untracked local Faster R-CNN files were reviewed against the current project protocol and updated before any comparison experiment. This is a fully local, randomly initialized ResNet-style/FPN/RPN/RoI-Align detector; it does not use a pretrained backbone or high-level torchvision detector model.
+
+- **Correctness and reproducibility:** fixed the FPN proposal-level assignment to the canonical P3--P6 mapping; added seed control, DataLoader worker seeding, strict five-field YOLO label validation, `data.yaml` taxonomy validation, safe empty-sample losses, and validation-loss computation in `eval()` mode so validation batches cannot update BatchNorm statistics.
+- **Training/evaluation parity:** added optional tempered foreground class weights and class-balanced sampling (both disabled by default), preserved Faster R-CNN's internal background index while keeping external labels zero-indexed, saved class counts/weights and inference metadata in checkpoints, restored legacy checkpoint compatibility, and added configurable per-class NMS using the current candidate score `$0.001$, IoU `$0.70$, and at most 300 detections defaults.
+- **Reusable CV tooling:** added generic sequential `run_faster_rcnn_kfold_cv.py` and `eval_faster_rcnn_kfold_cv.py` scripts. They discover/validate standard `fold_<n>` layouts, reject incompatible partial or completed checkpoints, emit machine-readable per-fold metrics, and aggregate overall/per-class mean and sample SD.
+- **Validation completed:** syntax/type checks passed; a synthetic forward/loss/backward/inference test passed; the five-class grouped-fold data loader/weighting test passed; both CV tools passed dry runs; and a one-epoch CUDA smoke pass at 128 pixels on a deliberately tiny fold-1 subset created and restored a checkpoint successfully. The tiny subset had only Spaghetti labels and obtained zero metric values, so it is **not** an experiment, model result, or comparison with YOLO26/YOLO11n. Separate fold-1 resource smokes passed with the `s` model at batch size 2 and tempered class-weight power `0.25`: 0.58 GiB peak allocated CUDA memory at 640 pixels and 0.77 GiB at 960 pixels. Therefore 960/batch-2 is available for a separately scoped matched-resolution baseline. The local Faster R-CNN `s` model has 28.86M parameters versus YOLO26 `n` at 2.66M, so any future comparison must disclose this capacity mismatch.
+- **Protocol boundary:** do not treat Faster R-CNN as a replacement for the selected YOLO26 configuration or start a full Faster R-CNN CV study unless it is separately scoped. Any future comparison must use the same group-disjoint folds, fixed training budget, and project metrics, and be described as an unpretrained custom two-stage comparison rather than a direct comparison to pretrained YOLO11n.
 
 ## 2. Dataset Facts and Label Audit
 
@@ -558,21 +568,49 @@ For the 960 checkpoints, NMS improves mAP50 by `+0.0345`, mAP50-95 by `+0.0084`,
 
 **NMS decision:** adopt class-aware NMS at IoU `0.70`, candidate score `0.001`, and maximum 300 detections as the standard custom inference/evaluation decoder. The gains show duplicate-box postprocessing was a real custom inference defect. It does not close the large gap to pretrained YOLO11n, and it does not solve Stringing or the sparse-data limitations, but it is a valid no-retraining improvement.
 
-**Current custom result and next boundary:** the strongest fixed custom configuration is now 960 input plus class-aware NMS: mAP50 `0.1127 ± 0.0232`, mAP50-95 `0.0343 ± 0.0076`, precision `0.1621 ± 0.0497`, and recall `0.0588 ± 0.0172` at `0.25`. Stop tuning this export. The next real-world improvement is data/annotation work. If a future custom-model engineering milestone is required, first design and test a distributional box-regression (`reg_max > 1`) head upgrade, because localization remains weak even after NMS; do not start that new architecture experiment without a separately frozen protocol.
+**Current custom result and next boundary:** the strongest fixed custom configuration remains 960 input plus class-aware NMS: mAP50 `0.1127 ± 0.0232`, mAP50-95 `0.0343 ± 0.0076`, precision `0.1621 ± 0.0497`, and recall `0.0588 ± 0.0172` at `0.25`. The separately frozen DFL architecture experiment below did not improve it. Stop tuning this export. The next real-world improvement is data/annotation work; any future architecture milestone must be separately motivated and pre-registered.
 
-##### Next custom architecture milestone: distributional box regression (planned, not started)
+##### Distributional box regression (`reg_max=16`): implemented, validated, and rejected by three-fold CV (2026-07-19)
 
-If the project goal is specifically to improve the **custom YOLO26** implementation rather than to finish the data-quality/reporting phase, the next and only recommended model change is a distributional bounding-box regression head. The current model uses `reg_max=1`: it directly predicts four box distances, which limits localization precision. This is consistent with the persistent gap between mAP50 and mAP50-95 even after higher resolution and NMS. The proposed architecture change is `reg_max=16`, matching the standard DFL-style localization approach used by modern YOLO-family heads.
+The custom architecture milestone was implemented and tested. The previous head used `reg_max=1`, which directly regressed four box distances. The configurable DFL path uses `reg_max=16`: each left/top/right/bottom distance is represented by 16 logits, softmax-normalized, and decoded by its expected discrete distance. It was intended to improve localization quality, so mAP50-95 was the primary experiment outcome.
 
-This is a code milestone, not a command that can be run yet. Before training, implementation must:
+Implementation changes include:
 
-1. add `reg_max` to the model configuration, detection-head output channels, raw decoding, loss construction, checkpoint metadata, and evaluator restoration;
-2. preserve compatibility with all existing `reg_max=1` checkpoints and the current 960 + NMS evaluator;
-3. add unit checks for distributional decoding, box output shapes, NMS compatibility, and legacy checkpoint restoration;
-4. pass a five-class CUDA forward/loss/backward smoke test at 960; and
-5. pre-register one `reg_max=16` full three-fold run that changes no data, image size, batch size, focal setting, positive weights, sampler, augmentation, seed, epoch budget, NMS, or evaluation threshold.
+1. [models/yolo26_torch.py](models/yolo26_torch.py) now provides `DistributionIntegral`, configurable detection-head channels $4\times\texttt{reg\_max}$, and DFL decoding before box construction;
+2. [train_yolo26.py](train_yolo26.py) now accepts `--reg-max`, decodes DFL logits for task assignment, and uses Ultralytics `BboxLoss(reg_max)` to enable the DFL loss path when `reg_max > 1`;
+3. [eval_yolo26.py](eval_yolo26.py) restores `reg_max` from new checkpoints while treating missing legacy metadata as `reg_max=1`, preserving all existing checkpoint compatibility;
+4. [run_yolo26_kfold_cv.py](run_yolo26_kfold_cv.py) records and verifies `reg_max` across every fold; and
+5. [test.py](test.py) verifies DFL integral decoding, DFL-head output shape, finite decoded predictions, and class-aware NMS compatibility.
 
-The primary outcome for that future experiment is mAP50-95; mAP50, per-class AP, and operating precision/recall are secondary safeguards. It may improve localization but is not expected to erase the practical gap to pretrained YOLO11n, because it does not add pretrained features or new data diversity.
+Validation completed before the DFL training run:
+
+| Check | Result |
+| --- | --- |
+| Legacy 640/960 checkpoint restoration | Passed: pre-DFL checkpoint with no saved `reg_max` restores as `reg_max=1` and loads successfully. |
+| New DFL checkpoint restoration | Passed: a `reg_max=16` model state, including `detect.dfl.project`, restores successfully. |
+| DFL architecture smoke test | Passed: five-class raw head shape at 640 is `(1, 69, 8400)`, where $69=5+4\times16$; decoded output remains `(1, 9, 8400)` and postprocessed output remains `(1, 300, 6)`. |
+| Five-class CUDA forward/loss/backward smoke test | Passed at 960, batch size 8, focal gamma 2, positive-weight power 0.25: finite total loss `17.3030`, including finite DFL regression loss `9.2143`, with peak allocated CUDA memory 2.93 GiB. |
+| Generic K-fold command validation | Passed: the runner generates the intended `--reg-max 16` command for all three candidate folds. |
+
+The pre-registered one-variable experiment changed only `--reg-max` from 1 to 16; it kept the candidate data, group-disjoint folds, 960 input, batch size 8, focal gamma 2, positive-weight power 0.25, no sampler, no augmentation, seed 42, 50-epoch budget, and class-aware NMS fixed. The completed command was:
+
+```text
+python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/candidate_cv3_imgsz960_dfl_r16_focal_g2_posweight_p025_seed42_e50 --epochs 50 --batch-size 8 --imgsz 960 --workers 0 --lr 5e-5 --weight-decay 5e-4 --seed 42 --device cuda --scale n --box-gain 7.5 --cls-gain 0.5 --reg-gain 1.5 --reg-max 16 --one2many-topk 10 --one2one-topk 1 --focal-gamma 2.0 --class-positive-weight-power 0.25 --balanced-sampling-power 1.0
+
+python eval_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/candidate_cv3_imgsz960_dfl_r16_focal_g2_posweight_p025_seed42_e50 --imgsz 960 --batch-size 8 --workers 0 --device cuda --conf-thresh 0.25
+```
+
+| Metric at threshold `0.25` | 960 + NMS direct regression | 960 + NMS DFL (`reg_max=16`) | DFL minus direct |
+| --- | ---: | ---: | ---: |
+| Selected checkpoint epoch | 38 / 42 / 50 | 17 / 25 / 27 | Earlier minimum validation loss in every DFL fold. |
+| mAP50 | **0.1127 ± 0.0232** | 0.0802 ± 0.0258 | -0.0325 |
+| mAP50-95 | **0.0343 ± 0.0076** | 0.0258 ± 0.0093 | -0.0086 |
+| Precision | **0.1621 ± 0.0497** | 0.1083 ± 0.0898 | -0.0538 |
+| Recall | **0.0588 ± 0.0172** | 0.0351 ± 0.0097 | -0.0237 |
+
+The DFL run is a **valid negative result**: architecture smoke tests, DFL loss/backpropagation, checkpoint restoration, and evaluation all passed, but the fixed three-fold experiment degraded both aggregate AP measures and recall. It did not solve localization under the frozen 50-epoch, fixed-gain protocol. Its selected validation-loss epochs were earlier than the direct-regression run, but extending epochs or changing DFL gain would be a new duration/loss sweep and is not authorized by this controlled protocol.
+
+Only Layer cracking AP50 rose slightly (`0.0511` to `0.0576`), with high uncertainty; all other classes declined in AP50 relative to 960 + NMS. In particular, Over extrusion fell from `0.1890` to `0.1131`, Stringing from `0.0259` to `0.0153`, and Warping from `0.2636` to `0.1885`. Therefore **reject `reg_max=16` as the current custom configuration**. Preserve the implementation as a documented, tested experimental capability, but do not use its checkpoints as the model baseline and do not tune DFL hyperparameters on this candidate export.
 
 In parallel, the data-first work should start now: use [group_manifest.csv](cv-data/roboflow-3d-print-fail-v1/group_manifest.csv) with `fold=1` to avoid repeated rows, then review every group containing Layer cracking, Stringing, or Warping for box/class consistency. Prioritize the rare groups before collecting new printer sessions and normal/hard-negative examples. Do not use the old public test partition for decisions.
 
@@ -970,7 +1008,7 @@ Only after this control should future custom-model ablations test focal loss or 
 - The detector is a local educational YOLO26-style PyTorch implementation, not an official installed YOLO26 model.
 - The original exported splits contain exact duplicate images and annotation disagreements. Existing split metrics are diagnostic results, not leakage-free generalization estimates.
 - The clean preprocessing comparison is complete under the same exported split. CLAHE+Canny is rejected as a relative result, while CLAHE's small observed aggregate advantage must be rechecked under corrected group-disjoint folds.
-- Faster R-CNN remains planned and is not implemented.
+- Faster R-CNN is implemented and workflow-smoke-tested, but no full group-disjoint Faster R-CNN study has been run. It remains an unpretrained comparison architecture, not a selected replacement for the custom YOLO26 or pretrained YOLO11n results.
 - The current test split overlaps training/validation and must never be reused for model selection or tuning. A future final test set must be newly reserved and group-disjoint.
 
 ## 10. Files Changed During This Work
@@ -988,6 +1026,9 @@ Only after this control should future custom-model ablations test focal loss or 
 - [eval_yolo26_kfold_cv.py](eval_yolo26_kfold_cv.py): generic custom-YOLO26 K-fold evaluator and overall/per-class aggregate reporter.
 - [run_ultralytics_kfold_cv.py](run_ultralytics_kfold_cv.py): generic sequential pretrained-Ultralytics K-fold reference trainer.
 - [eval_ultralytics_kfold_cv.py](eval_ultralytics_kfold_cv.py): generic pretrained-Ultralytics K-fold evaluator using project metrics after NMS.
+- [models/faster_rcnn.py](models/faster_rcnn.py): local two-stage Faster R-CNN with ResNet-style FPN, RPN, RoI Align, class-agnostic box regression, and configurable per-class NMS.
+- [train_faster_rcnn.py](train_faster_rcnn.py) and [eval_faster_rcnn.py](eval_faster_rcnn.py): strict-label, reproducible one-fold Faster R-CNN training/evaluation with checkpoint metadata and JSON metrics output.
+- [run_faster_rcnn_kfold_cv.py](run_faster_rcnn_kfold_cv.py) and [eval_faster_rcnn_kfold_cv.py](eval_faster_rcnn_kfold_cv.py): generic sequential Faster R-CNN K-fold trainer/evaluator with aggregate reporting.
 - [requirements.txt](requirements.txt): explicitly pins the installed Ultralytics version required by the custom loss imports and generic pretrained reference scripts.
 - [README.md](README.md): links to this work log and distinguishes preliminary metrics from future group-disjoint evaluation.
 - [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md): this persistent engineering and experiment record.

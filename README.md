@@ -59,7 +59,7 @@ The detector expects bounding boxes. During preprocessing, five-field source row
 ### Object Detection Models
 
 * YOLO26-style one-stage detector: implemented as the primary model.
-* Faster R-CNN: planned alternative comparison architecture; not yet implemented in this repository.
+* Faster R-CNN: implemented as a fully local two-stage comparison architecture; it has passed workflow smoke tests but has not been benchmarked on the project folds.
 
 ## Implemented YOLO26-style Pipeline
 
@@ -67,9 +67,9 @@ This repository includes a local PyTorch YOLO26-style architecture based on the 
 
 ### Components
 
-* `models/yolo26_torch.py` defines the backbone, PAN/FPN neck, C3k2, SPPF, C2PSA attention, and dual one-to-many/one-to-one detection branches.
+* `models/yolo26_torch.py` defines the backbone, PAN/FPN neck, C3k2, SPPF, C2PSA attention, dual one-to-many/one-to-one detection branches, class-aware NMS, and configurable direct/DFL-style box decoding.
 * `test.py` runs a forward-pass smoke test and prints output tensor shapes.
-* `train_yolo26.py` trains the model from scratch using Task-Aligned Assignment, BCE classification loss, IoU box loss, AdamW, AMP, and gradient clipping.
+* `train_yolo26.py` trains the model from scratch using Task-Aligned Assignment, focal/BCE classification loss, direct or distributional (DFL) box regression, AdamW, AMP, and gradient clipping.
 * `eval_yolo26.py` evaluates a saved checkpoint on validation or test data.
 * `detection_metrics.py` computes AP, mAP50, mAP50-95, precision, recall, per-class metrics, and a detection confusion matrix.
 
@@ -81,8 +81,22 @@ python test.py
 
 Expected output shape pattern:
 
-* one_to_many: `(batch, 4 + num_classes, 8400)`
+* direct regression (`reg_max=1`) one_to_many: `(batch, 4 + num_classes, 8400)`
+* DFL regression (`reg_max=R`) one_to_many: `(batch, 4R + num_classes, 8400)`
 * one_to_one: `(batch, 300, 6)`
+
+`--reg-max 1` preserves the legacy direct-distance head. Values above 1 enable DFL-style distributional box regression. A controlled `--reg-max 16` three-fold experiment was completed at the same 960 + NMS settings, but it did not improve mAP50 or mAP50-95; direct regression remains the selected custom head for this dataset and protocol.
+
+## Implemented Faster R-CNN Pipeline
+
+The alternative detector is also implemented locally and has no pretrained backbone or high-level torchvision detector dependency. It uses a ResNet-style backbone, P3--P6 FPN, RPN, multi-level RoI Align, class-agnostic box regression, and per-class NMS. Dataset labels remain zero-indexed YOLO IDs outside the model; Faster R-CNN shifts foreground labels internally because it reserves index `0` for background.
+
+* `models/faster_rcnn.py` implements the detector, canonical FPN proposal-level assignment, configurable candidate/NMS settings, and validation-loss computation without updating BatchNorm statistics.
+* `train_faster_rcnn.py` is the reproducible one-fold training primitive with strict label validation, `data.yaml` metadata validation, optional foreground class weighting/sampling, AMP, gradient clipping, checkpoint metadata, and JSONL history.
+* `eval_faster_rcnn.py` restores checkpoint settings, validates the selected dataset taxonomy, applies per-class NMS, and can write project-metric JSON.
+* `run_faster_rcnn_kfold_cv.py` and `eval_faster_rcnn_kfold_cv.py` provide generic sequential grouped-CV training and aggregate evaluation for the standard `fold_<n>` layout.
+
+The implementation was exercised with a one-epoch, 128-pixel, two-training-image/one-validation-image CUDA smoke test only. It is not a performance result and must not be compared with the completed YOLO26 or pretrained YOLO11n studies.
 
 ### Image Processing Techniques
 
@@ -122,12 +136,15 @@ That 960-pixel custom ablation is now complete. It improved aggregate custom per
 
 The fixed class-aware NMS diagnostic is now complete and requires no retraining. Applying class-aware NMS with IoU $0.70$, candidate score $0.001$, and at most 300 detections before top-$k$ truncation raises the 960 custom result to mAP50 $0.1127 \pm 0.0232$, mAP50-95 $0.0343 \pm 0.0076$, and precision $0.1621 \pm 0.0497$, with essentially unchanged recall at $0.0588 \pm 0.0172$. This is the current custom evaluation/inference decoder; use `--postprocess legacy_topk` only to reproduce historical reports. No further export-level sweeps are planned.
 
+A fixed three-fold DFL (`reg_max=16`) box-regression experiment was then evaluated with the same 960 input, focal/weight settings, NMS, batch size, seed, and epoch budget. It was rejected: mAP50 was $0.0802 \pm 0.0258$ and mAP50–95 was $0.0258 \pm 0.0093$, both below direct regression plus NMS. The DFL implementation and compatibility tests remain in the codebase as a documented negative architecture result; the selected custom head remains direct regression (`reg_max=1`).
+
 ### Reusable K-fold cross-validation
 
 The project separates one-fold model logic from cross-validation orchestration:
 
 - [train_yolo26.py](train_yolo26.py) and [eval_yolo26.py](eval_yolo26.py) train/evaluate one standard YOLO dataset root containing `data.yaml`, `train/`, and `valid/`.
 - [run_yolo26_kfold_cv.py](run_yolo26_kfold_cv.py) and [eval_yolo26_kfold_cv.py](eval_yolo26_kfold_cv.py) run and aggregate any dataset arranged as `fold_1/`, `fold_2/`, and so on. They infer class metadata from each fold's `data.yaml`, validate taxonomy consistency, and run folds sequentially.
+- [run_faster_rcnn_kfold_cv.py](run_faster_rcnn_kfold_cv.py) and [eval_faster_rcnn_kfold_cv.py](eval_faster_rcnn_kfold_cv.py) provide the equivalent fully local Faster R-CNN workflow, including frozen-setting checkpoint checks and overall/per-class metric aggregation.
 - [run_ultralytics_kfold_cv.py](run_ultralytics_kfold_cv.py) and [eval_ultralytics_kfold_cv.py](eval_ultralytics_kfold_cv.py) provide a generic pretrained Ultralytics reference workflow for the same fold layout.
 
 Example custom YOLO26 K-fold invocation:
@@ -135,6 +152,13 @@ Example custom YOLO26 K-fold invocation:
 ```bash
 python run_yolo26_kfold_cv.py --data-root cv-data/my-dataset --run-root runs/yolo26/my-study --epochs 50 --lr 5e-5
 python eval_yolo26_kfold_cv.py --data-root cv-data/my-dataset --run-root runs/yolo26/my-study --conf-thresh 0.25
+```
+
+Equivalent Faster R-CNN invocation:
+
+```bash
+python run_faster_rcnn_kfold_cv.py --data-root cv-data/my-dataset --run-root runs/faster_rcnn/my-study --epochs 50 --imgsz 640 --scale s
+python eval_faster_rcnn_kfold_cv.py --data-root cv-data/my-dataset --run-root runs/faster_rcnn/my-study --imgsz 640 --conf-thresh 0.25
 ```
 
 Use `--dry-run` with either script to inspect detected folds and commands without starting training or evaluation.

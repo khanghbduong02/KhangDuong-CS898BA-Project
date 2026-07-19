@@ -339,12 +339,15 @@ class BranchDetectionLoss:
         cls_gain: float,
         reg_gain: float,
         tal_topk: int,
+        reg_max: int = 1,
         class_positive_weights: torch.Tensor | None = None,
         focal_gamma: float = 0.0,
     ) -> None:
         self.device = device
         self.nc = nc
-        self.reg_max = 1
+        if reg_max <= 0:
+            raise ValueError("reg_max must be positive")
+        self.reg_max = reg_max
         self.box_gain = box_gain
         self.cls_gain = cls_gain
         self.reg_gain = reg_gain
@@ -359,6 +362,7 @@ class BranchDetectionLoss:
             raise ValueError("Positive class weights must all be greater than zero")
         self.class_positive_weights = class_positive_weights.detach().to(device=device, dtype=torch.float32).reshape(nc)
         self.stride = torch.tensor(strides, dtype=torch.float32, device=device)
+        self.dfl_project = torch.arange(reg_max, dtype=torch.float32, device=device)
         self.assigner = TaskAlignedAssigner(
             topk=tal_topk,
             num_classes=nc,
@@ -367,6 +371,20 @@ class BranchDetectionLoss:
             stride=list(strides),
         )
         self.bbox_loss = BboxLoss(self.reg_max).to(device)
+
+    def decode_distances(self, pred_distri: torch.Tensor) -> torch.Tensor:
+        """Decode direct distances or DFL logits into `(batch, anchors, 4)` distances."""
+        if self.reg_max == 1:
+            return pred_distri
+        batch_size, anchors, channels = pred_distri.shape
+        expected_channels = 4 * self.reg_max
+        if channels != expected_channels:
+            raise ValueError(
+                f"Expected {expected_channels} distributional box channels, got {channels}"
+            )
+        probabilities = pred_distri.view(batch_size, anchors, 4, self.reg_max).softmax(dim=-1)
+        project = self.dfl_project.to(dtype=pred_distri.dtype)
+        return probabilities.matmul(project)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         nl, ne = targets.shape
@@ -399,7 +417,7 @@ class BranchDetectionLoss:
         gt_labels, gt_bboxes = targets.split((1, 4), dim=2)
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
-        pred_bboxes = dist2bbox(pred_distri, anchor_points, xywh=False)
+        pred_bboxes = dist2bbox(self.decode_distances(pred_distri), anchor_points, xywh=False)
         _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
@@ -452,6 +470,7 @@ class E2EDetectLoss:
         reg_gain: float,
         one2many_topk: int,
         one2one_topk: int,
+        reg_max: int = 1,
         class_positive_weights: torch.Tensor | None = None,
         focal_gamma: float = 0.0,
     ) -> None:
@@ -463,6 +482,7 @@ class E2EDetectLoss:
             cls_gain,
             reg_gain,
             tal_topk=one2many_topk,
+            reg_max=reg_max,
             class_positive_weights=class_positive_weights,
             focal_gamma=focal_gamma,
         )
@@ -474,6 +494,7 @@ class E2EDetectLoss:
             cls_gain,
             reg_gain,
             tal_topk=one2one_topk,
+            reg_max=reg_max,
             class_positive_weights=class_positive_weights,
             focal_gamma=focal_gamma,
         )
@@ -601,7 +622,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--box-gain", type=float, default=7.5, help="Box IoU loss multiplier")
     parser.add_argument("--cls-gain", type=float, default=0.5, help="Classification BCE loss multiplier")
-    parser.add_argument("--reg-gain", type=float, default=1.5, help="Regression term multiplier (DFL-style slot; L1 when reg_max=1)")
+    parser.add_argument("--reg-gain", type=float, default=1.5, help="Direct-distance L1 or DFL loss multiplier")
+    parser.add_argument(
+        "--reg-max",
+        type=int,
+        default=1,
+        help="Box distance bins per side; 1 preserves direct regression, values above 1 enable DFL",
+    )
     parser.add_argument("--one2many-topk", type=int, default=10, help="Task-aligned top-k for one-to-many assignment")
     parser.add_argument("--one2one-topk", type=int, default=1, help="Task-aligned top-k for one-to-one assignment")
     parser.add_argument("--save-dir", type=Path, default=Path("runs/yolo26"), help="Output directory for checkpoints")
@@ -633,6 +660,8 @@ def main() -> None:
         )
     if args.num_classes <= 0:
         raise ValueError("--num-classes must be positive")
+    if args.reg_max <= 0:
+        raise ValueError("--reg-max must be positive")
 
     train_dataset = YoloDetectionDataset(train_root, imgsz=args.imgsz, fraction=args.fraction)
     valid_dataset = YoloDetectionDataset(valid_root, imgsz=args.imgsz, fraction=args.fraction)
@@ -672,7 +701,7 @@ def main() -> None:
         collate_fn=collate_fn,
     )
 
-    model = build_yolo26(nc=args.num_classes, scale=args.scale).to(device)
+    model = build_yolo26(nc=args.num_classes, scale=args.scale, reg_max=args.reg_max).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
     criterion = E2EDetectLoss(
@@ -684,6 +713,7 @@ def main() -> None:
         reg_gain=args.reg_gain,
         one2many_topk=args.one2many_topk,
         one2one_topk=args.one2one_topk,
+        reg_max=args.reg_max,
         class_positive_weights=class_positive_weights,
         focal_gamma=args.focal_gamma,
     )
@@ -708,6 +738,7 @@ def main() -> None:
         f"box_counts=({class_count_summary}) weights=({class_weight_summary})"
     )
     print(f"Classification focal gamma={args.focal_gamma:g}")
+    print(f"Box regression: reg_max={args.reg_max} ({'DFL' if args.reg_max > 1 else 'direct distances'})")
     if sampler_counts is not None:
         count_summary = ", ".join(f"class_{class_id}:{count}" for class_id, count in enumerate(sampler_counts))
         print(
