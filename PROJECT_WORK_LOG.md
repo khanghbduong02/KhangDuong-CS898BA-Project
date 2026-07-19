@@ -576,6 +576,38 @@ The primary outcome for that future experiment is mAP50-95; mAP50, per-class AP,
 
 In parallel, the data-first work should start now: use [group_manifest.csv](cv-data/roboflow-3d-print-fail-v1/group_manifest.csv) with `fold=1` to avoid repeated rows, then review every group containing Layer cracking, Stringing, or Warping for box/class consistency. Prioritize the rare groups before collecting new printer sessions and normal/hard-negative examples. Do not use the old public test partition for decisions.
 
+##### Minority-group visual review package: added (not a data change)
+
+[review_grouped_annotations.py](review_grouped_annotations.py) creates an ignored local HTML review package from any compatible `group_manifest.csv`. It draws normalized CV labels onto the materialized fold images, creates one page per group, and writes editable `review_groups.csv` and `review_images.csv` decision sheets. It never modifies raw images, labels, folds, checkpoints, or manifest files.
+
+For the current candidate, use fold 1 and classes `1 3 4`; this selects 179 of 823 unique groups and 272 images, covering the 57 Layer-cracking, 59 Stringing, and 80 Warping groups. Build the package with:
+
+```text
+python review_grouped_annotations.py --manifest cv-data/roboflow-3d-print-fail-v1/group_manifest.csv --fold 1 --class-ids 1 3 4 --output-dir review-data/candidate-minority-fold1 --overwrite
+```
+
+Open `review-data/candidate-minority-fold1/index.html`, inspect every image within a selected group, and fill `review_groups.csv` with `keep`, `correct`, or `exclude` plus notes. The ignored `review-data/` output is intentionally local only; corrections must first be documented and then applied to a separately versioned curated dataset rather than the downloaded source archive.
+
+**Review-policy clarification:** for diffuse defects—especially Spaghetti and Stringing—multiple bounding-box geometries can be semantically valid. A reviewer must **not** mark an annotation `correct` merely because they would draw a tighter, looser, or differently partitioned box. For the current audit, mark `keep` if the defect class is visually present and the existing box(es) provide a defensible coarse region for that defect. Mark `correct` only for a wrong/absent class, a box that targets an unrelated region or plainly misses the defect, or an instance-count violation after a written policy is agreed. Mark `exclude` when the image/group cannot support a consistent semantic decision. Record `diffuse_geometry` in the review notes where multiple boundary choices remain valid.
+
+This is a task-definition limitation, not a reason to rewrite labels to one reviewer's arbitrary box preference. It partly limits the absolute interpretation of strict IoU metrics such as mAP50-95; however, it does not invalidate the relative 640/960/NMS or pretrained-reference comparisons because those comparisons use the same frozen labels and folds. Before creating a curated label version, define one documented policy per defect: whether separated but causally related filament clusters are one instance or multiple instances, what visible region a box must cover, and when a diffuse defect should instead be labeled at image/event level. If the operational goal is simply to raise a defect alarm, a future multi-label image-level classification or segmentation study may be more appropriate than requiring pixel-tight object boxes for Spaghetti/Stringing.
+
+##### Multi-label image-classification scope assessment: recommended after label-policy work (not started)
+
+**Recommendation:** if the intended project question is “which failure types are visible in this image?” rather than “where is each individual failure instance?”, make **multi-label image-level classification** the primary final task and retain the current detector as a secondary localization/diagnostic study. This is a scope change, not a quick metric substitution. It is particularly appropriate for diffuse Spaghetti/Stringing because it avoids forcing a single arbitrary bounding-box boundary. It must be **multi-label**, not multi-class/softmax: one image can contain multiple failure types.
+
+The existing fold-1 labels confirm multi-label behavior: 95 of 2,281 training images and 48 of 1,140 validation images contain more than one class. Image-level positive counts in fold 1 are `2,116 / 66 / 83 / 52 / 59` for Spaghetti / Layer cracking / Over extrusion / Stringing / Warping in training, and `1,057 / 33 / 42 / 27 / 29` in validation. However, all 3,421 images in this grouped development pool have at least one existing box label. Thus it contains no verified all-negative/normal images, and a missing box class is a reliable image-level negative only after the label audit confirms that annotation is exhaustive for that class.
+
+Do **not** train a final classifier from the current box-derived labels yet. Before implementation:
+
+1. finalize the semantic policy for every defect, including diffuse-instance rules and an explicit “normal/no listed defect” definition;
+2. complete the group review, adding `image_label_missing`, `uncertain`, or `diffuse_geometry` notes where appropriate;
+3. collect genuinely independent normal/hard-negative printer-session groups and additional minority groups; never create fake normal images by deleting labels;
+4. create image-level multi-hot targets from the curated labels while retaining the existing source-/near-duplicate-group-disjoint folds; and
+5. evaluate with per-class and macro average precision plus per-class recall/precision. Do not use ordinary accuracy, and select any per-class operating thresholds only within the cross-validation protocol.
+
+The initial classifier should use five independent sigmoid outputs with BCE/focal-style loss, not one softmax output. After the curated image-level protocol exists, compare a custom YOLO26-backbone classifier with a documented pretrained classification reference on the same folds. Detection can still be used for compact/localizable defects or as an optional visual explanation, but it should not be the sole final metric for diffuse failure alerts.
+
 ### Candidate review: Roboflow `3d print fail` Dataset v1
 
 Candidate URL: <https://universe.roboflow.com/mikes-workspace-oebho/3d-print-fail-7ipuj/dataset/1>

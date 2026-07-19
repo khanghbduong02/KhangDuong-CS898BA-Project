@@ -6,6 +6,7 @@ cv-data/
 debug-data/
 processed-data-aug20/
 processed-data-aug20-exact/
+review-data/
 __pycache__/
 runs/
 *.zip
