@@ -72,18 +72,18 @@ def match_per_image(
         return torch.zeros((0,), dtype=torch.float32)
 
     order = pred_scores.argsort(descending=True)
-    pred_boxes = pred_boxes[order]
-    pred_labels = pred_labels[order]
+    sorted_boxes = pred_boxes[order]
+    sorted_labels = pred_labels[order]
 
     matched_gt = torch.zeros((gt_boxes.shape[0],), dtype=torch.bool)
-    tp = torch.zeros((pred_boxes.shape[0],), dtype=torch.float32)
+    sorted_tp = torch.zeros((sorted_boxes.shape[0],), dtype=torch.float32)
 
     if gt_boxes.numel() == 0:
-        return tp
+        return sorted_tp
 
-    ious = box_iou(pred_boxes, gt_boxes)
-    for i in range(pred_boxes.shape[0]):
-        same_class = gt_labels == pred_labels[i]
+    ious = box_iou(sorted_boxes, gt_boxes)
+    for i in range(sorted_boxes.shape[0]):
+        same_class = gt_labels == sorted_labels[i]
         if not same_class.any():
             continue
 
@@ -91,9 +91,13 @@ def match_per_image(
         candidate_ious[~same_class] = -1.0
         best_iou, best_j = candidate_ious.max(dim=0)
         if best_iou >= iou_thresh and not matched_gt[best_j]:
-            tp[i] = 1.0
+            sorted_tp[i] = 1.0
             matched_gt[best_j] = True
 
+    # AP later sorts confidences globally. Restore the original prediction order
+    # so each true-positive flag remains paired with its own confidence value.
+    tp = torch.zeros_like(sorted_tp)
+    tp[order] = sorted_tp
     return tp
 
 

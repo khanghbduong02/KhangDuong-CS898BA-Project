@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import argparse
-import ast
+import json
 import pickle
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 
 from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
-from models.yolo26_torch import build_yolo26
+from models.yolo26_torch import build_yolo26, class_aware_nms
 from train_yolo26 import E2EDetectLoss, STRIDES, YoloDetectionDataset, collate_fn, compute_loss
+from yolo_dataset_config import read_yolo_dataset_config
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,50 +26,87 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=2, help="DataLoader worker count")
     parser.add_argument("--fraction", type=float, default=1.0, help="Subset fraction for quick evaluation")
     parser.add_argument("--device", type=str, default="cuda", help="Evaluation device, e.g. cuda or cuda:0")
-    parser.add_argument("--scale", type=str, default="n", help="YOLO26 scale variant")
-    parser.add_argument("--box-gain", type=float, default=7.5, help="Box IoU loss multiplier")
-    parser.add_argument("--cls-gain", type=float, default=0.5, help="Classification BCE loss multiplier")
-    parser.add_argument("--reg-gain", type=float, default=1.5, help="Regression term multiplier")
-    parser.add_argument("--one2many-topk", type=int, default=10, help="Task-aligned top-k for one-to-many assignment")
-    parser.add_argument("--one2one-topk", type=int, default=1, help="Task-aligned top-k for one-to-one assignment")
+    parser.add_argument("--scale", type=str, default=None, help="YOLO26 scale variant; defaults to the saved checkpoint value")
+    parser.add_argument("--box-gain", type=float, default=None, help="Box IoU loss multiplier; defaults to the saved checkpoint value")
+    parser.add_argument("--cls-gain", type=float, default=None, help="Classification BCE loss multiplier; defaults to the saved checkpoint value")
+    parser.add_argument("--focal-gamma", type=float, default=None, help="Classification focal-loss gamma; defaults to the saved checkpoint value")
+    parser.add_argument("--reg-gain", type=float, default=None, help="Regression term multiplier; defaults to the saved checkpoint value")
+    parser.add_argument("--one2many-topk", type=int, default=None, help="Task-aligned top-k for one-to-many assignment; defaults to the saved checkpoint value")
+    parser.add_argument("--one2one-topk", type=int, default=None, help="Task-aligned top-k for one-to-one assignment; defaults to the saved checkpoint value")
     parser.add_argument("--conf-thresh", type=float, default=0.25, help="Confidence threshold used for precision/recall summary")
+    parser.add_argument(
+        "--postprocess",
+        choices=["legacy_topk", "class_aware_nms"],
+        default="class_aware_nms",
+        help=(
+            "Inference postprocessor; class_aware_nms is the validated standard, while legacy_topk "
+            "reproduces prior top-k-only reports"
+        ),
+    )
+    parser.add_argument(
+        "--nms-iou",
+        type=float,
+        default=0.70,
+        help="Class-aware NMS IoU threshold when --postprocess=class_aware_nms",
+    )
+    parser.add_argument(
+        "--nms-score-thresh",
+        type=float,
+        default=0.001,
+        help="Minimum score retained before class-aware NMS for AP computation",
+    )
+    parser.add_argument(
+        "--max-det",
+        type=int,
+        default=300,
+        help="Maximum detections retained per image after postprocessing",
+    )
+    parser.add_argument(
+        "--metrics-output",
+        type=Path,
+        default=None,
+        help="Optional JSON path for machine-readable evaluation metrics",
+    )
     return parser.parse_args()
 
 
-def _load_class_info_from_data_yaml(data_root: Path) -> Tuple[Optional[int], Optional[List[str]]]:
-    data_yaml = data_root / "data.yaml"
-    if not data_yaml.exists():
-        return None, None
+def _resolve_evaluation_settings(
+    checkpoint: Dict[str, object],
+    args: argparse.Namespace,
+) -> Tuple[str, float, float, float, float, int, int]:
+    """Use explicit CLI settings first, then checkpoint settings, then legacy defaults."""
+    saved_args = checkpoint.get("args", {})
+    if not isinstance(saved_args, dict):
+        saved_args = {}
 
-    nc: Optional[int] = None
-    names: Optional[List[str]] = None
+    scale = args.scale if args.scale is not None else str(saved_args.get("scale", "n"))
+    box_gain = args.box_gain if args.box_gain is not None else float(saved_args.get("box_gain", 7.5))
+    cls_gain = args.cls_gain if args.cls_gain is not None else float(saved_args.get("cls_gain", 0.5))
+    focal_gamma = args.focal_gamma if args.focal_gamma is not None else float(saved_args.get("focal_gamma", 0.0))
+    reg_gain = args.reg_gain if args.reg_gain is not None else float(saved_args.get("reg_gain", 1.5))
+    one2many_topk = args.one2many_topk if args.one2many_topk is not None else int(saved_args.get("one2many_topk", 10))
+    one2one_topk = args.one2one_topk if args.one2one_topk is not None else int(saved_args.get("one2one_topk", 1))
+    return scale, box_gain, cls_gain, focal_gamma, reg_gain, one2many_topk, one2one_topk
 
-    for raw_line in data_yaml.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or ":" not in line:
-            continue
 
-        key, value = line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
+def _load_positive_class_weights(
+    checkpoint: Dict[str, object],
+    num_classes: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Restore checkpoint positive-class BCE weights, or neutral weights for legacy checkpoints."""
+    saved_weights = checkpoint.get("class_positive_weights")
+    if saved_weights is None:
+        return torch.ones(num_classes, device=device, dtype=torch.float32)
 
-        if key == "nc":
-            try:
-                nc = int(value)
-            except ValueError:
-                nc = None
-
-        if key == "names":
-            try:
-                parsed = ast.literal_eval(value)
-                if isinstance(parsed, list):
-                    names = [str(v) for v in parsed]
-                elif isinstance(parsed, dict):
-                    names = [str(parsed[i]) for i in sorted(parsed.keys())]
-            except (ValueError, SyntaxError):
-                names = None
-
-    return nc, names
+    weights = torch.as_tensor(saved_weights, device=device, dtype=torch.float32).reshape(-1)
+    if weights.numel() != num_classes:
+        raise ValueError(
+            f"Checkpoint has {weights.numel()} positive class weights, expected {num_classes} from the dataset"
+        )
+    if not torch.isfinite(weights).all() or (weights <= 0).any():
+        raise ValueError("Checkpoint positive class weights must be finite and greater than zero")
+    return weights
 
 
 def main() -> None:
@@ -76,23 +114,22 @@ def main() -> None:
 
     if not torch.cuda.is_available() and args.device.startswith("cuda"):
         raise RuntimeError("CUDA device requested but no GPU is available to PyTorch.")
+    if not 0.0 <= args.conf_thresh <= 1.0:
+        raise ValueError("--conf-thresh must be in [0, 1]")
+    if not 0.0 < args.nms_iou <= 1.0:
+        raise ValueError("--nms-iou must be in (0, 1]")
+    if not 0.0 <= args.nms_score_thresh <= 1.0:
+        raise ValueError("--nms-score-thresh must be in [0, 1]")
+    if args.max_det <= 0:
+        raise ValueError("--max-det must be positive")
 
     split_root = args.data_root / args.split
     if not split_root.exists():
         raise FileNotFoundError(f"Expected split folder at {split_root}")
 
-    yaml_nc, yaml_names = _load_class_info_from_data_yaml(args.data_root)
-    if yaml_nc is None:
-        raise ValueError(f"Could not read 'nc' from {args.data_root / 'data.yaml'}")
-    num_classes = yaml_nc
-
-    if yaml_names is not None:
-        class_names = yaml_names
-    else:
-        class_names = [f"class_{i}" for i in range(num_classes)]
-
-    if len(class_names) != num_classes:
-        raise ValueError(f"Class name count ({len(class_names)}) does not match num_classes ({num_classes})")
+    dataset_config = read_yolo_dataset_config(args.data_root)
+    num_classes = dataset_config.num_classes
+    class_names = list(dataset_config.class_names)
 
     device = torch.device(args.device)
     try:
@@ -114,7 +151,10 @@ def main() -> None:
                 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.serialization")
                 checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
-    model = build_yolo26(nc=num_classes, scale=args.scale).to(device)
+    scale, box_gain, cls_gain, focal_gamma, reg_gain, one2many_topk, one2one_topk = _resolve_evaluation_settings(checkpoint, args)
+    class_positive_weights = _load_positive_class_weights(checkpoint, num_classes, device)
+
+    model = build_yolo26(nc=num_classes, scale=scale, topk=args.max_det).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     dataset = YoloDetectionDataset(split_root, imgsz=args.imgsz, fraction=args.fraction)
@@ -131,11 +171,22 @@ def main() -> None:
         nc=num_classes,
         strides=STRIDES,
         device=device,
-        box_gain=args.box_gain,
-        cls_gain=args.cls_gain,
-        reg_gain=args.reg_gain,
-        one2many_topk=args.one2many_topk,
-        one2one_topk=args.one2one_topk,
+        box_gain=box_gain,
+        cls_gain=cls_gain,
+        reg_gain=reg_gain,
+        one2many_topk=one2many_topk,
+        one2one_topk=one2one_topk,
+        class_positive_weights=class_positive_weights,
+        focal_gamma=focal_gamma,
+    )
+    class_weight_summary = ", ".join(
+        f"class_{class_id}:{weight:.3f}" for class_id, weight in enumerate(class_positive_weights.tolist())
+    )
+    print(
+        f"Evaluation settings: scale={scale} box_gain={box_gain:g} cls_gain={cls_gain:g} focal_gamma={focal_gamma:g} "
+        f"reg_gain={reg_gain:g} one2many_topk={one2many_topk} one2one_topk={one2one_topk} "
+        f"positive_class_weights=({class_weight_summary}) postprocess={args.postprocess} "
+        f"nms_iou={args.nms_iou:g} nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det}"
     )
     model.eval()
     total_loss = 0.0
@@ -165,11 +216,24 @@ def main() -> None:
             total_box += float((loss_breakdown.box_loss + loss_breakdown.reg_loss).item())
             total_batches += 1
 
-            batch_preds = outputs["one_to_one"].detach().cpu()
-            for idx, target in enumerate(targets):
-                pred_boxes = batch_preds[idx, :, :4].float()
-                pred_scores = batch_preds[idx, :, 4].float()
-                pred_labels = batch_preds[idx, :, 5].long()
+            if args.postprocess == "legacy_topk":
+                batch_preds = [prediction.detach().cpu() for prediction in outputs["one_to_one"]]
+            else:
+                batch_preds = [
+                    prediction.detach().cpu()
+                    for prediction in class_aware_nms(
+                        outputs["decoded"],
+                        num_classes=num_classes,
+                        score_threshold=args.nms_score_thresh,
+                        iou_threshold=args.nms_iou,
+                        max_detections=args.max_det,
+                    )
+                ]
+
+            for prediction, target in zip(batch_preds, targets):
+                pred_boxes = prediction[:, :4].float()
+                pred_scores = prediction[:, 4].float()
+                pred_labels = prediction[:, 5].long()
 
                 gt_boxes = xywhn_to_xyxy(target[:, 1:5].float(), args.imgsz) if target.numel() else torch.zeros((0, 4), dtype=torch.float32)
                 gt_labels = target[:, 0].long() if target.numel() else torch.zeros((0,), dtype=torch.long)
@@ -189,6 +253,37 @@ def main() -> None:
         num_classes=num_classes,
         conf_thresh=args.conf_thresh,
     )
+
+    if args.metrics_output is not None:
+        metrics_output = {
+            "checkpoint": str(args.checkpoint),
+            "checkpoint_epoch": int(checkpoint.get("epoch", 0)),
+            "data_root": str(args.data_root),
+            "split": args.split,
+            "image_count": len(dataset),
+            "confidence_threshold": args.conf_thresh,
+            "loss": loss,
+            "cls_loss": cls_loss,
+            "box_loss": box_loss,
+            "evaluation_settings": {
+                "scale": scale,
+                "box_gain": box_gain,
+                "cls_gain": cls_gain,
+                "focal_gamma": focal_gamma,
+                "reg_gain": reg_gain,
+                "one2many_topk": one2many_topk,
+                "one2one_topk": one2one_topk,
+                "positive_class_weights": class_positive_weights.detach().cpu().tolist(),
+                "class_names": class_names,
+                "postprocess": args.postprocess,
+                "nms_iou": args.nms_iou,
+                "nms_score_threshold": args.nms_score_thresh,
+                "max_detections": args.max_det,
+            },
+            "metrics": metrics,
+        }
+        args.metrics_output.parent.mkdir(parents=True, exist_ok=True)
+        args.metrics_output.write_text(json.dumps(metrics_output, indent=2) + "\n", encoding="utf-8")
 
     print(
         f"split={args.split} images={len(dataset)} "

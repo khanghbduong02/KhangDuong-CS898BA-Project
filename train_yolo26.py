@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Sequence, Tuple
@@ -10,16 +11,42 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from ultralytics.utils.loss import BboxLoss
 from ultralytics.utils.ops import xywh2xyxy
 from ultralytics.utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors
 
 from models.yolo26_torch import build_yolo26
+from yolo_dataset_config import read_yolo_dataset_config
 
 
 VALID_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 STRIDES = (8, 16, 32)
+
+
+def focal_bce_with_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    positive_weights: torch.Tensor,
+    focal_gamma: float,
+) -> torch.Tensor:
+    """Return elementwise BCE, optionally down-weighting easy classified anchors."""
+    if focal_gamma < 0.0:
+        raise ValueError("Focal gamma must be greater than or equal to zero")
+
+    bce = F.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        reduction="none",
+        pos_weight=positive_weights.to(dtype=logits.dtype),
+    )
+    if focal_gamma == 0.0:
+        return bce
+
+    probabilities = logits.sigmoid()
+    p_t = targets * probabilities + (1.0 - targets) * (1.0 - probabilities)
+    focal_weight = (1.0 - p_t).clamp(min=0.0).pow(focal_gamma)
+    return bce * focal_weight
 
 
 class YoloDetectionDataset(Dataset):
@@ -65,11 +92,27 @@ class YoloDetectionDataset(Dataset):
         label_path = self.labels_dir / f"{image_path.stem}.txt"
         labels = []
         if label_path.exists():
-            for line in label_path.read_text(encoding="utf-8").splitlines():
+            for line_number, line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), start=1):
                 parts = line.strip().split()
-                if len(parts) < 5:
+                if not parts:
                     continue
-                labels.append([float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])])
+                if len(parts) != 5:
+                    raise ValueError(
+                        f"{label_path}:{line_number}: expected five-field YOLO detection label "
+                        "(class x_center y_center width height). Run preprocess_dataset.py to normalize polygon labels."
+                    )
+
+                try:
+                    class_id, x_center, y_center, width, height = (float(value) for value in parts)
+                except ValueError as exc:
+                    raise ValueError(f"{label_path}:{line_number}: label values must be numeric") from exc
+
+                if class_id != int(class_id) or not (0.0 <= x_center <= 1.0 and 0.0 <= y_center <= 1.0):
+                    raise ValueError(f"{label_path}:{line_number}: invalid class ID or normalized box center")
+                if not (0.0 < width <= 1.0 and 0.0 < height <= 1.0):
+                    raise ValueError(f"{label_path}:{line_number}: normalized box width and height must be in (0, 1]")
+
+                labels.append([class_id, x_center, y_center, width, height])
 
         labels_tensor = torch.tensor(labels, dtype=torch.float32) if labels else torch.zeros((0, 5), dtype=torch.float32)
         return image_tensor, labels_tensor
@@ -79,6 +122,116 @@ def collate_fn(batch: Sequence[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torc
     images = torch.stack([item[0] for item in batch], dim=0)
     targets = [item[1] for item in batch]
     return images, targets
+
+
+def _read_label_class_ids(label_path: Path, num_classes: int) -> set[int]:
+    return {
+        class_id
+        for class_id, count in enumerate(_read_label_class_counts(label_path, num_classes))
+        if count > 0
+    }
+
+
+def _read_label_class_counts(label_path: Path, num_classes: int) -> list[int]:
+    if not label_path.exists():
+        return [0 for _ in range(num_classes)]
+
+    counts = [0 for _ in range(num_classes)]
+    for line_number, line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), start=1):
+        parts = line.strip().split()
+        if not parts:
+            continue
+        if len(parts) != 5:
+            raise ValueError(
+                f"{label_path}:{line_number}: expected five-field YOLO detection label while building sampler"
+            )
+
+        try:
+            class_value = float(parts[0])
+        except ValueError as exc:
+            raise ValueError(f"{label_path}:{line_number}: class ID must be numeric") from exc
+
+        class_id = int(class_value)
+        if class_value != class_id or not 0 <= class_id < num_classes:
+            raise ValueError(f"{label_path}:{line_number}: class ID {parts[0]!r} is outside 0..{num_classes - 1}")
+        counts[class_id] += 1
+
+    return counts
+
+
+def build_positive_class_weights(
+    dataset: YoloDetectionDataset,
+    num_classes: int,
+    power: float = 0.0,
+) -> tuple[torch.Tensor, list[int]]:
+    """Build normalized inverse-frequency weights for positive classification terms only."""
+    if not 0.0 <= power <= 1.0:
+        raise ValueError("Positive class-weight power must be between 0.0 and 1.0")
+
+    class_box_counts = [0 for _ in range(num_classes)]
+    for image_path in dataset.image_paths:
+        label_counts = _read_label_class_counts(dataset.labels_dir / f"{image_path.stem}.txt", num_classes)
+        for class_id, count in enumerate(label_counts):
+            class_box_counts[class_id] += count
+
+    if any(count == 0 for count in class_box_counts):
+        raise ValueError(f"Cannot build positive class weights because box counts are {class_box_counts}")
+
+    max_count = max(class_box_counts)
+    raw_weights = torch.tensor(
+        [(max_count / count) ** power for count in class_box_counts],
+        dtype=torch.float32,
+    )
+    counts_tensor = torch.tensor(class_box_counts, dtype=torch.float32)
+    normalized_weights = raw_weights / (counts_tensor * raw_weights).sum() * counts_tensor.sum()
+    return normalized_weights, class_box_counts
+
+
+def build_class_balanced_sampler(
+    dataset: YoloDetectionDataset,
+    num_classes: int,
+    power: float = 1.0,
+    generator: torch.Generator | None = None,
+) -> tuple[WeightedRandomSampler, list[int], int]:
+    """Oversample images containing rare classes without generating new files."""
+    if not 0.0 <= power <= 1.0:
+        raise ValueError("Class-balanced sampling power must be between 0.0 and 1.0")
+
+    sample_class_ids: list[set[int]] = []
+    class_image_counts = [0 for _ in range(num_classes)]
+    background_images = 0
+
+    for image_path in dataset.image_paths:
+        class_ids = _read_label_class_ids(dataset.labels_dir / f"{image_path.stem}.txt", num_classes)
+        sample_class_ids.append(class_ids)
+        if not class_ids:
+            background_images += 1
+        for class_id in class_ids:
+            class_image_counts[class_id] += 1
+
+    if any(count == 0 for count in class_image_counts):
+        raise ValueError(f"Cannot build class-balanced sampler because class image counts are {class_image_counts}")
+
+    majority_count = max(class_image_counts)
+    class_weights = [(majority_count / count) ** power for count in class_image_counts]
+    weights = [max((class_weights[class_id] for class_id in class_ids), default=1.0) for class_ids in sample_class_ids]
+    sampler = WeightedRandomSampler(
+        torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(dataset),
+        replacement=True,
+        generator=generator,
+    )
+    return sampler, class_image_counts, background_images
+
+
+def seed_everything(seed: int) -> None:
+    """Set the random sources used by model initialization and data loading."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
 
 def build_dense_targets(
@@ -186,14 +339,25 @@ class BranchDetectionLoss:
         cls_gain: float,
         reg_gain: float,
         tal_topk: int,
+        class_positive_weights: torch.Tensor | None = None,
+        focal_gamma: float = 0.0,
     ) -> None:
         self.device = device
         self.nc = nc
         self.reg_max = 1
-        self.bce = nn.BCEWithLogitsLoss(reduction="none")
         self.box_gain = box_gain
         self.cls_gain = cls_gain
         self.reg_gain = reg_gain
+        if focal_gamma < 0.0:
+            raise ValueError("Focal gamma must be greater than or equal to zero")
+        self.focal_gamma = focal_gamma
+        if class_positive_weights is None:
+            class_positive_weights = torch.ones(nc, dtype=torch.float32)
+        if class_positive_weights.numel() != nc:
+            raise ValueError(f"Expected {nc} positive class weights, got {class_positive_weights.numel()}")
+        if (class_positive_weights <= 0).any():
+            raise ValueError("Positive class weights must all be greater than zero")
+        self.class_positive_weights = class_positive_weights.detach().to(device=device, dtype=torch.float32).reshape(nc)
         self.stride = torch.tensor(strides, dtype=torch.float32, device=device)
         self.assigner = TaskAlignedAssigner(
             topk=tal_topk,
@@ -246,7 +410,12 @@ class BranchDetectionLoss:
         )
 
         target_scores_sum = target_scores.sum().clamp(min=1.0)
-        cls_loss = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+        cls_loss = focal_bce_with_logits(
+            pred_scores,
+            target_scores.to(dtype),
+            self.class_positive_weights,
+            self.focal_gamma,
+        ).sum() / target_scores_sum
 
         box_loss = torch.zeros((), device=self.device)
         reg_loss = torch.zeros((), device=self.device)
@@ -283,9 +452,31 @@ class E2EDetectLoss:
         reg_gain: float,
         one2many_topk: int,
         one2one_topk: int,
+        class_positive_weights: torch.Tensor | None = None,
+        focal_gamma: float = 0.0,
     ) -> None:
-        self.one2many = BranchDetectionLoss(nc, strides, device, box_gain, cls_gain, reg_gain, tal_topk=one2many_topk)
-        self.one2one = BranchDetectionLoss(nc, strides, device, box_gain, cls_gain, reg_gain, tal_topk=one2one_topk)
+        self.one2many = BranchDetectionLoss(
+            nc,
+            strides,
+            device,
+            box_gain,
+            cls_gain,
+            reg_gain,
+            tal_topk=one2many_topk,
+            class_positive_weights=class_positive_weights,
+            focal_gamma=focal_gamma,
+        )
+        self.one2one = BranchDetectionLoss(
+            nc,
+            strides,
+            device,
+            box_gain,
+            cls_gain,
+            reg_gain,
+            tal_topk=one2one_topk,
+            class_positive_weights=class_positive_weights,
+            focal_gamma=focal_gamma,
+        )
 
     def __call__(self, outputs: dict[str, Any], batch: dict[str, torch.Tensor]) -> LossBreakdown:
         loss_many = self.one2many(outputs["one2many"], batch)
@@ -376,9 +567,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=5e-4, help="AdamW weight decay")
     parser.add_argument("--workers", type=int, default=2, help="DataLoader worker count")
     parser.add_argument("--fraction", type=float, default=1.0, help="Train/validation subset fraction for quick runs")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed used for reproducible training")
+    parser.add_argument(
+        "--class-positive-weight-power",
+        type=float,
+        default=0.0,
+        help="Tempered inverse-frequency power from 0.0 (disabled) to 1.0 for positive class BCE terms",
+    )
+    parser.add_argument(
+        "--focal-gamma",
+        type=float,
+        default=0.0,
+        help="Focal-loss gamma for classification; 0.0 preserves BCE and values such as 2.0 down-weight easy anchors",
+    )
+    parser.add_argument(
+        "--balanced-sampling",
+        action="store_true",
+        help="Oversample train images containing rare classes without creating augmented image files",
+    )
+    parser.add_argument(
+        "--balanced-sampling-power",
+        type=float,
+        default=1.0,
+        help="Sampling strength from 0.0 (uniform) to 1.0 (full inverse-frequency weighting)",
+    )
     parser.add_argument("--device", type=str, default="cuda", help="Training device, e.g. cuda or cuda:0")
     parser.add_argument("--scale", type=str, default="n", help="YOLO26 scale variant")
-    parser.add_argument("--num-classes", type=int, default=3, help="Number of detection classes")
+    parser.add_argument(
+        "--num-classes",
+        type=int,
+        default=None,
+        help="Number of detection classes; defaults to the nc value in data-root/data.yaml",
+    )
     parser.add_argument("--box-gain", type=float, default=7.5, help="Box IoU loss multiplier")
     parser.add_argument("--cls-gain", type=float, default=0.5, help="Classification BCE loss multiplier")
     parser.add_argument("--reg-gain", type=float, default=1.5, help="Regression term multiplier (DFL-style slot; L1 when reg_max=1)")
@@ -395,21 +615,53 @@ def main() -> None:
         raise RuntimeError("CUDA device requested but no GPU is available to PyTorch.")
 
     device = torch.device(args.device)
+    seed_everything(args.seed)
+    train_loader_generator = torch.Generator().manual_seed(args.seed)
+    sampler_generator = torch.Generator().manual_seed(args.seed)
     train_root = args.data_root / "train"
     valid_root = args.data_root / "valid"
     if not train_root.exists() or not valid_root.exists():
         raise FileNotFoundError(f"Expected train/valid folders under {args.data_root}")
 
+    dataset_config = read_yolo_dataset_config(args.data_root)
+    if args.num_classes is None:
+        args.num_classes = dataset_config.num_classes
+    elif args.num_classes != dataset_config.num_classes:
+        raise ValueError(
+            f"--num-classes={args.num_classes} does not match data.yaml nc={dataset_config.num_classes} "
+            f"under {args.data_root}"
+        )
+    if args.num_classes <= 0:
+        raise ValueError("--num-classes must be positive")
+
     train_dataset = YoloDetectionDataset(train_root, imgsz=args.imgsz, fraction=args.fraction)
     valid_dataset = YoloDetectionDataset(valid_root, imgsz=args.imgsz, fraction=args.fraction)
+    class_positive_weights, class_box_counts = build_positive_class_weights(
+        train_dataset,
+        args.num_classes,
+        power=args.class_positive_weight_power,
+    )
+
+    train_sampler = None
+    sampler_counts: list[int] | None = None
+    background_images = 0
+    if args.balanced_sampling:
+        train_sampler, sampler_counts, background_images = build_class_balanced_sampler(
+            train_dataset,
+            args.num_classes,
+            power=args.balanced_sampling_power,
+            generator=sampler_generator,
+        )
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=args.workers,
         pin_memory=device.type == "cuda",
         collate_fn=collate_fn,
+        generator=train_loader_generator,
     )
     valid_loader = DataLoader(
         valid_dataset,
@@ -432,6 +684,8 @@ def main() -> None:
         reg_gain=args.reg_gain,
         one2many_topk=args.one2many_topk,
         one2one_topk=args.one2one_topk,
+        class_positive_weights=class_positive_weights,
+        focal_gamma=args.focal_gamma,
     )
     use_amp = device.type == "cuda"
 
@@ -440,7 +694,26 @@ def main() -> None:
     last_path = args.save_dir / "last.pt"
 
     best_val = float("inf")
-    print(f"Training on device={device}, train_images={len(train_dataset)}, valid_images={len(valid_dataset)}")
+    print(
+        f"Training on device={device}, train_images={len(train_dataset)}, valid_images={len(valid_dataset)}, "
+        f"seed={args.seed}"
+    )
+    print(f"Dataset classes: nc={args.num_classes} names={list(dataset_config.class_names)}")
+    class_count_summary = ", ".join(f"class_{class_id}:{count}" for class_id, count in enumerate(class_box_counts))
+    class_weight_summary = ", ".join(
+        f"class_{class_id}:{weight:.3f}" for class_id, weight in enumerate(class_positive_weights.tolist())
+    )
+    print(
+        f"Positive class weighting: power={args.class_positive_weight_power:.2f} "
+        f"box_counts=({class_count_summary}) weights=({class_weight_summary})"
+    )
+    print(f"Classification focal gamma={args.focal_gamma:g}")
+    if sampler_counts is not None:
+        count_summary = ", ".join(f"class_{class_id}:{count}" for class_id, count in enumerate(sampler_counts))
+        print(
+            f"Class-balanced sampling enabled: power={args.balanced_sampling_power:.2f} "
+            f"image_counts=({count_summary}) background_images={background_images}"
+        )
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_cls, train_box = run_epoch(
@@ -471,6 +744,9 @@ def main() -> None:
             "train_loss": train_loss,
             "val_loss": val_loss,
             "args": vars(args),
+            "class_names": list(dataset_config.class_names),
+            "class_box_counts": class_box_counts,
+            "class_positive_weights": class_positive_weights.detach().cpu(),
         }
         torch.save(checkpoint, last_path)
         if val_loss < best_val:

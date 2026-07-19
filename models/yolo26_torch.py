@@ -19,6 +19,80 @@ SCALE_CONFIG = {
 STRIDES = (8.0, 16.0, 32.0)
 
 
+def class_aware_nms(
+    decoded: torch.Tensor,
+    num_classes: int,
+    score_threshold: float = 0.001,
+    iou_threshold: float = 0.70,
+    max_detections: int = 300,
+) -> list[torch.Tensor]:
+    """Apply class-aware NMS to raw decoded one-to-one predictions.
+
+    `decoded` has shape ``(batch, 4 + nc, anchors)`` and stores pixel-space
+    ``xyxy`` boxes followed by sigmoid class scores. This deliberately runs
+    before the legacy global top-k selection so a duplicated high-score anchor
+    cannot consume the limited detection budget ahead of a distinct object.
+    Each returned tensor has shape ``(detections, 6)`` with columns
+    ``x1, y1, x2, y2, score, class_id``.
+    """
+    if decoded.ndim != 3 or decoded.shape[1] != 4 + num_classes:
+        raise ValueError(
+            f"Expected decoded predictions with shape (batch, {4 + num_classes}, anchors), "
+            f"got {tuple(decoded.shape)}"
+        )
+    if not 0.0 <= score_threshold <= 1.0:
+        raise ValueError("NMS score threshold must be in [0, 1]")
+    if not 0.0 < iou_threshold <= 1.0:
+        raise ValueError("NMS IoU threshold must be in (0, 1]")
+    if max_detections <= 0:
+        raise ValueError("NMS max detections must be positive")
+
+    try:
+        from torchvision.ops import batched_nms
+    except ImportError as exc:
+        raise RuntimeError(
+            "Class-aware NMS requires torchvision.ops.batched_nms. Install a torchvision build matching PyTorch."
+        ) from exc
+
+    results: list[torch.Tensor] = []
+    for image_predictions in decoded.float():
+        boxes = image_predictions[:4].transpose(0, 1).contiguous()
+        scores = image_predictions[4:]
+        valid_boxes = (
+            torch.isfinite(boxes).all(dim=1)
+            & (boxes[:, 2] > boxes[:, 0])
+            & (boxes[:, 3] > boxes[:, 1])
+        )
+        candidate_indices = torch.nonzero(
+            (scores >= score_threshold) & valid_boxes.unsqueeze(0),
+            as_tuple=False,
+        )
+
+        if candidate_indices.numel() == 0:
+            results.append(torch.zeros((0, 6), dtype=torch.float32, device=decoded.device))
+            continue
+
+        class_ids = candidate_indices[:, 0].to(dtype=torch.long)
+        anchor_indices = candidate_indices[:, 1]
+        candidate_boxes = boxes[anchor_indices]
+        candidate_scores = scores[class_ids, anchor_indices]
+        finite_scores = torch.isfinite(candidate_scores)
+        candidate_boxes = candidate_boxes[finite_scores]
+        candidate_scores = candidate_scores[finite_scores]
+        class_ids = class_ids[finite_scores]
+
+        if candidate_scores.numel() == 0:
+            results.append(torch.zeros((0, 6), dtype=torch.float32, device=decoded.device))
+            continue
+
+        kept_indices = batched_nms(candidate_boxes, candidate_scores, class_ids, iou_threshold)[:max_detections]
+        kept_boxes = candidate_boxes[kept_indices]
+        kept_scores = candidate_scores[kept_indices].unsqueeze(1)
+        kept_classes = class_ids[kept_indices].to(dtype=kept_boxes.dtype).unsqueeze(1)
+        results.append(torch.cat((kept_boxes, kept_scores, kept_classes), dim=1))
+    return results
+
+
 def autopad(k: int, p: int | None = None, d: int = 1) -> int:
     if d > 1:
         k = d * (k - 1) + 1
