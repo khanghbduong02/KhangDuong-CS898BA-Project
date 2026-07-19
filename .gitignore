@@ -1,6 +1,13 @@
 roboflow-data/
 processed-data/
+candidate-data/
+processed-candidate-data/
+cv-data/
+debug-data/
+processed-data-aug20/
+processed-data-aug20-exact/
 __pycache__/
 runs/
 *.zip
 *.mp4
+*.pt
