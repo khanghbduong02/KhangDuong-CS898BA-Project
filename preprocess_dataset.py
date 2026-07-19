@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import random
 import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -11,6 +13,19 @@ import numpy as np
 
 
 VALID_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+LABEL_TOLERANCE = 1e-6
+
+
+@dataclass
+class LabelNormalizationStats:
+    label_files: int = 0
+    empty_files: int = 0
+    bbox_rows: int = 0
+    polygon_rows: int = 0
+    boxes_written: int = 0
+    clipped_rows: int = 0
+    bbox_by_class: dict[int, int] = field(default_factory=dict)
+    polygon_by_class: dict[int, int] = field(default_factory=dict)
 
 
 def preprocess_baseline(image_bgr: np.ndarray) -> np.ndarray:
@@ -79,17 +94,167 @@ def process_image(
     return bool(cv2.imwrite(str(output_path), processed))
 
 
-def copy_labels(input_split_dir: Path, output_split_dir: Path) -> None:
+def _parse_class_id(value: str, label_path: Path, line_number: int, num_classes: int) -> int:
+    try:
+        class_value = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{label_path}:{line_number}: class ID is not numeric: {value!r}") from exc
+
+    if not math.isfinite(class_value) or not class_value.is_integer():
+        raise ValueError(f"{label_path}:{line_number}: class ID must be a finite integer, got {value!r}")
+
+    class_id = int(class_value)
+    if not 0 <= class_id < num_classes:
+        raise ValueError(
+            f"{label_path}:{line_number}: class ID {class_id} is outside the configured range 0..{num_classes - 1}"
+        )
+    return class_id
+
+
+def _parse_normalized_values(values: list[str], label_path: Path, line_number: int) -> list[float]:
+    try:
+        parsed = [float(value) for value in values]
+    except ValueError as exc:
+        raise ValueError(f"{label_path}:{line_number}: label coordinates must be numeric") from exc
+
+    if not all(math.isfinite(value) for value in parsed):
+        raise ValueError(f"{label_path}:{line_number}: label coordinates must be finite")
+    if any(value < -LABEL_TOLERANCE or value > 1.0 + LABEL_TOLERANCE for value in parsed):
+        raise ValueError(f"{label_path}:{line_number}: normalized label coordinates must be in [0, 1]")
+
+    return [_clip01(value) for value in parsed]
+
+
+def _box_from_corners(
+    class_id: int,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    label_path: Path,
+    line_number: int,
+) -> tuple[tuple[int, float, float, float, float], bool]:
+    clipped_x1 = _clip01(x1)
+    clipped_y1 = _clip01(y1)
+    clipped_x2 = _clip01(x2)
+    clipped_y2 = _clip01(y2)
+    clipped = (clipped_x1, clipped_y1, clipped_x2, clipped_y2) != (x1, y1, x2, y2)
+
+    if clipped_x2 - clipped_x1 <= LABEL_TOLERANCE or clipped_y2 - clipped_y1 <= LABEL_TOLERANCE:
+        raise ValueError(f"{label_path}:{line_number}: annotation has zero-area bounding box after clipping")
+
+    x_center = (clipped_x1 + clipped_x2) / 2.0
+    y_center = (clipped_y1 + clipped_y2) / 2.0
+    width = clipped_x2 - clipped_x1
+    height = clipped_y2 - clipped_y1
+    return (class_id, x_center, y_center, width, height), clipped
+
+
+def normalize_label_row(
+    parts: list[str],
+    label_path: Path,
+    line_number: int,
+    num_classes: int,
+) -> tuple[tuple[int, float, float, float, float], str, bool]:
+    """Convert one raw detection or polygon row into a standard YOLO bounding box."""
+    class_id = _parse_class_id(parts[0], label_path, line_number, num_classes)
+
+    # Roboflow's documented YOLO detection export uses exactly five fields:
+    # class_id, x_center, y_center, width, height. A valid polygon needs at
+    # least three coordinate pairs, so it has at least seven fields total.
+    if len(parts) == 5:
+        x_center, y_center, width, height = _parse_normalized_values(parts[1:], label_path, line_number)
+        if width <= LABEL_TOLERANCE or height <= LABEL_TOLERANCE:
+            raise ValueError(f"{label_path}:{line_number}: YOLO box width and height must be positive")
+        box, clipped = _box_from_corners(
+            class_id,
+            x_center - width / 2.0,
+            y_center - height / 2.0,
+            x_center + width / 2.0,
+            y_center + height / 2.0,
+            label_path,
+            line_number,
+        )
+        return box, "bbox", clipped
+
+    if len(parts) >= 7 and len(parts) % 2 == 1:
+        polygon_values = _parse_normalized_values(parts[1:], label_path, line_number)
+        x_values = polygon_values[0::2]
+        y_values = polygon_values[1::2]
+        box, clipped = _box_from_corners(
+            class_id,
+            min(x_values),
+            min(y_values),
+            max(x_values),
+            max(y_values),
+            label_path,
+            line_number,
+        )
+        return box, "polygon", clipped
+
+    raise ValueError(
+        f"{label_path}:{line_number}: expected a five-field YOLO box or an odd-length polygon row with at least "
+        f"three points; found {len(parts)} fields"
+    )
+
+
+def normalize_labels(input_split_dir: Path, output_split_dir: Path, num_classes: int) -> LabelNormalizationStats:
     src_labels = input_split_dir / "labels"
     dst_labels = output_split_dir / "labels"
-
     if not src_labels.exists():
-        print(f"[WARN] Labels folder not found: {src_labels}")
-        return
+        raise FileNotFoundError(f"Labels folder not found: {src_labels}")
 
-    if dst_labels.exists():
-        shutil.rmtree(dst_labels)
-    shutil.copytree(src_labels, dst_labels)
+    dst_labels.mkdir(parents=True, exist_ok=True)
+    stats = LabelNormalizationStats()
+
+    for src_label_path in sorted(src_labels.glob("*.txt")):
+        stats.label_files += 1
+        normalized_boxes: list[tuple[int, float, float, float, float]] = []
+        has_annotation = False
+
+        for line_number, raw_line in enumerate(src_label_path.read_text(encoding="utf-8").splitlines(), start=1):
+            parts = raw_line.strip().split()
+            if not parts:
+                continue
+
+            has_annotation = True
+            box, row_type, clipped = normalize_label_row(parts, src_label_path, line_number, num_classes)
+            normalized_boxes.append(box)
+            stats.boxes_written += 1
+            stats.clipped_rows += int(clipped)
+
+            if row_type == "bbox":
+                stats.bbox_rows += 1
+                stats.bbox_by_class[box[0]] = stats.bbox_by_class.get(box[0], 0) + 1
+            else:
+                stats.polygon_rows += 1
+                stats.polygon_by_class[box[0]] = stats.polygon_by_class.get(box[0], 0) + 1
+
+        if not has_annotation:
+            stats.empty_files += 1
+        write_yolo_label_file(dst_labels / src_label_path.name, normalized_boxes)
+
+    return stats
+
+
+def print_label_normalization_summary(
+    split_name: str,
+    stats: LabelNormalizationStats,
+    class_names: list[str],
+) -> None:
+    bbox_summary = ", ".join(
+        f"{class_names[class_id]}:{stats.bbox_by_class.get(class_id, 0)}" for class_id in range(len(class_names))
+    )
+    polygon_summary = ", ".join(
+        f"{class_names[class_id]}:{stats.polygon_by_class.get(class_id, 0)}" for class_id in range(len(class_names))
+    )
+    print(
+        f"[LABEL][{split_name}] files={stats.label_files} empty={stats.empty_files} "
+        f"five_field_boxes={stats.bbox_rows} polygons_converted={stats.polygon_rows} "
+        f"boxes_written={stats.boxes_written} clipped={stats.clipped_rows}"
+    )
+    print(f"[LABEL][{split_name}] five_field_by_class=({bbox_summary})")
+    print(f"[LABEL][{split_name}] polygons_converted_by_class=({polygon_summary})")
 
 
 def write_data_yaml(dataset_root: Path, class_names: list[str]) -> None:
@@ -107,21 +272,22 @@ def write_data_yaml(dataset_root: Path, class_names: list[str]) -> None:
     (dataset_root / "data.yaml").write_text(content, encoding="utf-8")
 
 
-def read_yolo_label_file(label_path: Path) -> list[tuple[int, float, float, float, float]]:
+def read_yolo_label_file(label_path: Path, num_classes: int) -> list[tuple[int, float, float, float, float]]:
     boxes: list[tuple[int, float, float, float, float]] = []
     if not label_path.exists():
         return boxes
 
-    for raw in label_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line:
+    for line_number, raw_line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), start=1):
+        parts = raw_line.strip().split()
+        if not parts:
             continue
-        parts = line.split()
         if len(parts) != 5:
-            continue
-        class_id = int(float(parts[0]))
-        x, y, w, h = (float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]))
-        boxes.append((class_id, x, y, w, h))
+            raise ValueError(f"{label_path}:{line_number}: processed labels must contain exactly five fields")
+
+        box, row_type, _ = normalize_label_row(parts, label_path, line_number, num_classes)
+        if row_type != "bbox":
+            raise RuntimeError(f"{label_path}:{line_number}: expected a normalized bounding box")
+        boxes.append(box)
     return boxes
 
 
@@ -171,6 +337,7 @@ def apply_augmentation(
     boxes: list[tuple[int, float, float, float, float]],
     aug_name: str,
     rng: random.Random,
+    np_rng: np.random.Generator,
 ) -> tuple[np.ndarray, list[tuple[int, float, float, float, float]], str]:
     if aug_name == "hflip":
         aug_img = cv2.flip(image, 1)
@@ -197,7 +364,7 @@ def apply_augmentation(
     if aug_name == "noise":
         sigma = rng.uniform(5.0, 12.0)
         mu = rng.gauss(0.0, sigma)
-        noise_map = np.random.normal(mu, sigma, image.shape).astype(np.float32)
+        noise_map = np_rng.normal(mu, sigma, image.shape).astype(np.float32)
         aug_img = np.clip(image.astype(np.float32) + noise_map, 0, 255).astype(np.uint8)
         return aug_img, boxes, f"noise:mu={mu:.3f}:sigma={sigma:.3f}"
 
@@ -234,6 +401,7 @@ def augment_minority_classes(
     augmentations: list[str],
     seed: int,
 ) -> tuple[int, dict[int, int]]:
+    """Augment minority labels until their object counts approach the requested target ratio."""
     images_dir = split_dir / "images"
     labels_dir = split_dir / "labels"
     if not images_dir.exists() or not labels_dir.exists():
@@ -245,7 +413,7 @@ def augment_minority_classes(
     class_to_images: dict[int, list[Path]] = {i: [] for i in range(num_classes)}
 
     for label_path in label_files:
-        boxes = read_yolo_label_file(label_path)
+        boxes = read_yolo_label_file(label_path, num_classes=num_classes)
         if not boxes:
             continue
         image_to_boxes[label_path] = boxes
@@ -273,11 +441,13 @@ def augment_minority_classes(
         return 0, {i: 0 for i in range(num_classes)}
 
     rng = random.Random(seed)
+    np_rng = np.random.default_rng(seed)
     aug_created = 0
-    per_class_added = {i: 0 for i in range(num_classes)}
+    per_class_added_boxes = {i: 0 for i in range(num_classes)}
     aug_index = 0
     skipped_duplicate_signature = 0
     skipped_duplicate_hash = 0
+    skipped_missing_target = 0
     seen_signatures: set[str] = set()
     seen_hashes: set[str] = set()
 
@@ -294,6 +464,9 @@ def augment_minority_classes(
     while deficits:
         progressed = False
         for cid in sorted(list(deficits.keys()), key=lambda c: deficits[c], reverse=True):
+            if cid not in deficits:
+                continue
+
             candidates = class_to_images.get(cid, [])
             if not candidates:
                 deficits.pop(cid, None)
@@ -313,7 +486,9 @@ def augment_minority_classes(
                 if image is None:
                     continue
 
-                boxes = image_to_boxes.get(src_label, read_yolo_label_file(src_label))
+                boxes = image_to_boxes.get(src_label)
+                if boxes is None:
+                    boxes = read_yolo_label_file(src_label, num_classes=num_classes)
                 aug_name = augmentations[aug_index % len(augmentations)]
                 aug_index += 1
 
@@ -322,8 +497,14 @@ def augment_minority_classes(
                     boxes=boxes,
                     aug_name=aug_name,
                     rng=rng,
+                    np_rng=np_rng,
                 )
                 if not aug_boxes:
+                    continue
+
+                target_boxes_added = sum(1 for box_cid, _, _, _, _ in aug_boxes if box_cid == cid)
+                if target_boxes_added == 0:
+                    skipped_missing_target += 1
                     continue
 
                 signature = f"src={src_label.stem}|target={cid}|aug={aug_signature}"
@@ -354,14 +535,27 @@ def augment_minority_classes(
                 for box_cid in present_aug:
                     class_to_images[box_cid].append(out_label)
 
-                deficits[cid] -= 1
-                per_class_added[cid] += 1
+                added_box_counts = [0 for _ in range(num_classes)]
+                for box_cid, _, _, _, _ in aug_boxes:
+                    if 0 <= box_cid < num_classes:
+                        added_box_counts[box_cid] += 1
+
+                for box_cid, added_boxes in enumerate(added_box_counts):
+                    if added_boxes == 0:
+                        continue
+                    class_counts[box_cid] += added_boxes
+                    per_class_added_boxes[box_cid] += added_boxes
+
+                for deficit_class in list(deficits):
+                    remaining = target_count - class_counts[deficit_class]
+                    if remaining > 0:
+                        deficits[deficit_class] = remaining
+                    else:
+                        deficits.pop(deficit_class)
+
                 aug_created += 1
                 progressed = True
                 created_this_round = True
-
-                if deficits[cid] <= 0:
-                    deficits.pop(cid, None)
                 break
 
             if not created_this_round and cid in deficits:
@@ -372,10 +566,12 @@ def augment_minority_classes(
 
     print(
         f"[AUG][{split_dir.name}] dedup skipped_signature={skipped_duplicate_signature} "
-        f"skipped_hash={skipped_duplicate_hash}"
+        f"skipped_hash={skipped_duplicate_hash} skipped_missing_target={skipped_missing_target}"
     )
+    final_object_summary = ", ".join(f"class_{class_id}:{count}" for class_id, count in enumerate(class_counts))
+    print(f"[AUG][{split_dir.name}] target_boxes_per_minority_class={target_count} final_object_count=({final_object_summary})")
 
-    return aug_created, per_class_added
+    return aug_created, per_class_added_boxes
 
 
 def process_split(
@@ -389,6 +585,7 @@ def process_split(
     edge_overlay_weight: float,
     apply_minority_aug: bool,
     num_classes: int,
+    class_names: list[str],
     minority_target_ratio: float,
     minority_aug_seed: int,
 ) -> tuple[int, int]:
@@ -422,10 +619,11 @@ def process_split(
         else:
             failed += 1
 
-    copy_labels(input_split_dir, output_split_dir)
+    label_stats = normalize_labels(input_split_dir, output_split_dir, num_classes=num_classes)
+    print_label_normalization_summary(output_split_dir.name, label_stats, class_names)
 
     if apply_minority_aug:
-        aug_count, per_class_added = augment_minority_classes(
+        aug_count, per_class_added_boxes = augment_minority_classes(
             split_dir=output_split_dir,
             num_classes=num_classes,
             target_ratio=minority_target_ratio,
@@ -433,8 +631,10 @@ def process_split(
             seed=minority_aug_seed,
         )
         if aug_count > 0:
-            summary = ", ".join(f"class_{cid}:{count}" for cid, count in per_class_added.items() if count > 0)
-            print(f"[AUG][{output_split_dir.name}] added={aug_count} ({summary})")
+            summary = ", ".join(
+                f"class_{cid}:{count}" for cid, count in per_class_added_boxes.items() if count > 0
+            )
+            print(f"[AUG][{output_split_dir.name}] created_images={aug_count} boxes_added=({summary})")
 
     return success, failed
 
@@ -443,6 +643,7 @@ def run_pipeline(
     input_dir: Path,
     output_dir: Path,
     class_names: list[str],
+    methods: list[str],
     clip_limit: float,
     tile_grid_size: int,
     canny_low: int,
@@ -452,7 +653,13 @@ def run_pipeline(
     minority_target_ratio: float,
     minority_aug_seed: int,
 ) -> None:
-    methods = ["baseline", "clahe", "clahe_canny"]
+    supported_methods = {"baseline", "clahe", "clahe_canny"}
+    unsupported_methods = sorted(set(methods) - supported_methods)
+    if unsupported_methods:
+        raise ValueError(f"Unsupported preprocessing methods: {', '.join(unsupported_methods)}")
+    if not methods:
+        raise ValueError("At least one preprocessing method is required")
+
     splits = ["train", "valid", "test"]
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -484,6 +691,7 @@ def run_pipeline(
                 edge_overlay_weight=edge_overlay_weight,
                 apply_minority_aug=augment_minority_train and split == "train",
                 num_classes=len(class_names),
+                class_names=class_names,
                 minority_target_ratio=minority_target_ratio,
                 minority_aug_seed=minority_aug_seed,
             )
@@ -517,6 +725,13 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=["spaghetti", "stringing", "warping"],
         help="Class names written to data.yaml",
+    )
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        choices=["baseline", "clahe", "clahe_canny"],
+        default=["baseline", "clahe", "clahe_canny"],
+        help="Preprocessing variants to generate (default: all variants)",
     )
     parser.add_argument("--clip-limit", type=float, default=2.0, help="CLAHE clip limit")
     parser.add_argument("--tile-grid-size", type=int, default=8, help="CLAHE tile grid size")
@@ -558,6 +773,7 @@ def main() -> None:
         input_dir=args.input_dir,
         output_dir=args.output_dir,
         class_names=args.class_names,
+        methods=args.methods,
         clip_limit=args.clip_limit,
         tile_grid_size=args.tile_grid_size,
         canny_low=args.canny_low,
