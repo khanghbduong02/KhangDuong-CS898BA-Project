@@ -43,10 +43,14 @@ ANCHOR_RATIOS  = [0.5, 1.0, 2.0]        # anchor height/width aspect ratios
 NUM_ANCHORS    = len(ANCHOR_RATIOS)      # anchors per spatial location per level
 
 # RPN hyperparameters
-RPN_FG_IOU         = 0.7
+# The local model is trained from scratch. With a 0.7-only foreground rule,
+# several small targets receive just one supervised anchor, which lets the
+# objectness branch collapse to background before it can rank proposals.
+RPN_FG_IOU         = 0.5
 RPN_BG_IOU         = 0.3
 RPN_BATCH          = 256
 RPN_POS_FRAC       = 0.5
+RPN_FORCE_MATCH_TOPK = 4
 RPN_PRE_NMS_TRAIN  = 2000
 RPN_POST_NMS_TRAIN = 1000
 RPN_PRE_NMS_TEST   = 1000
@@ -283,6 +287,48 @@ class RPNHead(nn.Module):
         return obj_maps, box_maps
 
 
+def assign_rpn_targets(
+    anchors: torch.Tensor,
+    gt_boxes: torch.Tensor,
+    foreground_iou: float = RPN_FG_IOU,
+    background_iou: float = RPN_BG_IOU,
+    force_match_topk: int = RPN_FORCE_MATCH_TOPK,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Assign RPN foreground/background/ignore labels and matched GT indices.
+
+    Each target forces up to ``force_match_topk`` anchors positive, even when
+    no anchor reaches the foreground-IoU threshold. This provides sufficient
+    positive objectness/regression supervision for a randomly initialized RPN.
+    """
+    if anchors.ndim != 2 or anchors.shape[1] != 4:
+        raise ValueError("anchors must have shape (N, 4)")
+    if gt_boxes.ndim != 2 or gt_boxes.shape[1] != 4:
+        raise ValueError("gt_boxes must have shape (M, 4)")
+    if not 0.0 <= background_iou < foreground_iou <= 1.0:
+        raise ValueError("RPN IoU thresholds must satisfy 0 <= background < foreground <= 1")
+    if force_match_topk <= 0:
+        raise ValueError("force_match_topk must be positive")
+
+    labels = torch.full((anchors.shape[0],), -1, dtype=torch.long, device=anchors.device)
+    if gt_boxes.numel() == 0:
+        labels.fill_(0)
+        return labels, None
+    if anchors.numel() == 0:
+        return labels, None
+
+    iou = box_iou(anchors, gt_boxes)
+    max_iou, matched_gt = iou.max(dim=1)
+    labels[max_iou >= foreground_iou] = 1
+    labels[max_iou < background_iou] = 0
+
+    force_count = min(force_match_topk, anchors.shape[0])
+    for gt_index in range(gt_boxes.shape[0]):
+        forced_indices = iou[:, gt_index].topk(force_count).indices
+        labels[forced_indices] = 1
+        matched_gt[forced_indices] = gt_index
+    return labels, matched_gt
+
+
 class RPN(nn.Module):
 
     def __init__(self, in_ch: int) -> None:
@@ -351,26 +397,24 @@ class RPN(nn.Module):
             gt       = targets[i]["boxes"].to(device)
             obj_i    = obj_valid[i]
             box_i    = box_valid[i]
-            labels   = torch.full((V,), -1, dtype=torch.long, device=device)
-            matched_gt: Optional[torch.Tensor] = None
-
-            if gt.numel() > 0:
-                iou = box_iou(valid_a, gt)
-                max_iou, best_gt = iou.max(dim=1)
-                matched_gt = best_gt
-                labels[max_iou >= RPN_FG_IOU] = 1
-                labels[max_iou <  RPN_BG_IOU] = 0
-                labels[iou.argmax(dim=0)]      = 1   # guarantee each GT has anchor
-            else:
-                labels[:] = 0
+            labels, matched_gt = assign_rpn_targets(valid_a, gt)
 
             pos_idx = (labels == 1).nonzero(as_tuple=False).view(-1)
             neg_idx = (labels == 0).nonzero(as_tuple=False).view(-1)
-            n_pos   = min(pos_idx.numel(), int(RPN_BATCH * RPN_POS_FRAC))
+            target_pos = int(RPN_BATCH * RPN_POS_FRAC)
+            if 0 < pos_idx.numel() < target_pos:
+                # Oversample valid positive anchors for the loss only.
+                # Proposal generation never receives GT boxes or labels at
+                # inference, so this cannot leak target geometry.
+                pos_idx = pos_idx[
+                    torch.randint(pos_idx.numel(), (target_pos,), device=device)
+                ]
+            elif pos_idx.numel() > target_pos:
+                pos_idx = pos_idx[torch.randperm(pos_idx.numel(), device=device)[:target_pos]]
+
+            n_pos   = pos_idx.numel()
             n_neg   = min(neg_idx.numel(), RPN_BATCH - n_pos)
 
-            if pos_idx.numel() > n_pos:
-                pos_idx = pos_idx[torch.randperm(pos_idx.numel(), device=device)[:n_pos]]
             if neg_idx.numel() > n_neg:
                 neg_idx = neg_idx[torch.randperm(neg_idx.numel(), device=device)[:n_neg]]
 

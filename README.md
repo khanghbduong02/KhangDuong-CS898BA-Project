@@ -91,12 +91,13 @@ Expected output shape pattern:
 
 The alternative detector is also implemented locally and has no pretrained backbone or high-level torchvision detector dependency. It uses a ResNet-style backbone, P3--P6 FPN, RPN, multi-level RoI Align, class-agnostic box regression, and per-class NMS. Dataset labels remain zero-indexed YOLO IDs outside the model; Faster R-CNN shifts foreground labels internally because it reserves index `0` for background.
 
-* `models/faster_rcnn.py` implements the detector, canonical FPN proposal-level assignment, configurable candidate/NMS settings, and validation-loss computation without updating BatchNorm statistics.
+* `models/faster_rcnn.py` implements the detector, canonical FPN proposal-level assignment, multi-positive RPN supervision for from-scratch learning, configurable candidate/NMS settings, and validation-loss computation without updating BatchNorm statistics.
 * `train_faster_rcnn.py` is the reproducible one-fold training primitive with strict label validation, `data.yaml` metadata validation, optional foreground class weighting/sampling, AMP, gradient clipping, checkpoint metadata, and JSONL history.
 * `eval_faster_rcnn.py` restores checkpoint settings, validates the selected dataset taxonomy, applies per-class NMS, and can write project-metric JSON.
 * `run_faster_rcnn_kfold_cv.py` and `eval_faster_rcnn_kfold_cv.py` provide generic sequential grouped-CV training and aggregate evaluation for the standard `fold_<n>` layout.
+* `test_faster_rcnn.py` checks canonical FPN-level assignment, RPN multi-positive target assignment, finite loss/backpropagation, validation BatchNorm isolation, and per-class-NMS inference output.
 
-The implementation was exercised with a one-epoch, 128-pixel, two-training-image/one-validation-image CUDA smoke test only. It is not a performance result and must not be compared with the completed YOLO26 or pretrained YOLO11n studies.
+The implementation passed a same-images, three-class overfit diagnostic after an RPN-supervision repair: mAP50 `0.9881`, mAP50-95 `0.8109`, and recall `0.9869`. This validates the local learning path only; it is not a generalization or benchmark result. A pre-fix 960-pixel grouped-CV Faster R-CNN result is invalidated by that repair and must not be compared with YOLO26 or pretrained YOLO11n until one replacement CV baseline is completed.
 
 ### Image Processing Techniques
 
