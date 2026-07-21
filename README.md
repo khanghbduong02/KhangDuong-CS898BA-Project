@@ -59,7 +59,7 @@ The detector expects bounding boxes. During preprocessing, five-field source row
 ### Object Detection Models
 
 * YOLO26-style one-stage detector: implemented as the primary model.
-* Faster R-CNN: implemented as a fully local two-stage comparison architecture; it has passed workflow smoke tests but has not been benchmarked on the project folds.
+* Faster R-CNN: implemented as a fully local two-stage scratch reference and evaluated on the same grouped five-class folds after an RPN-supervision repair.
 
 ## Implemented YOLO26-style Pipeline
 
@@ -97,7 +97,9 @@ The alternative detector is also implemented locally and has no pretrained backb
 * `run_faster_rcnn_kfold_cv.py` and `eval_faster_rcnn_kfold_cv.py` provide generic sequential grouped-CV training and aggregate evaluation for the standard `fold_<n>` layout.
 * `test_faster_rcnn.py` checks canonical FPN-level assignment, RPN multi-positive target assignment, finite loss/backpropagation, validation BatchNorm isolation, and per-class-NMS inference output.
 
-The implementation passed a same-images, three-class overfit diagnostic after an RPN-supervision repair: mAP50 `0.9881`, mAP50-95 `0.8109`, and recall `0.9869`. This validates the local learning path only; it is not a generalization or benchmark result. A pre-fix 960-pixel grouped-CV Faster R-CNN result is invalidated by that repair and must not be compared with YOLO26 or pretrained YOLO11n until one replacement CV baseline is completed.
+For a separately labeled practical transfer-learning study, Faster R-CNN `s` can initialize its local ResNet-18-compatible backbone from torchvision ImageNet weights using `--backbone-weights imagenet`. Use `--backbone-lr-multiplier 0.1` to fine-tune those imported backbone weights more conservatively than the random FPN/RPN/RoI heads. This changes the study from scratch learning to transfer learning; it must be reported separately and is not an architecture-only comparison with the scratch detectors.
+
+The implementation passed a same-images, three-class overfit diagnostic after an RPN-supervision repair: mAP50 `0.9881`, mAP50-95 `0.8109`, and recall `0.9869`. This validates the local learning path only; it is not a generalization result. A replacement 960-pixel three-fold grouped-CV baseline then reached mAP50 $0.0935 \pm 0.0522$, mAP50-95 $0.0284 \pm 0.0203$, precision $0.1441 \pm 0.0157$, and recall $0.1445 \pm 0.0369$. It has lower and less stable aggregate mAP than direct YOLO26 + NMS, but higher recall. The two scratch systems differ substantially in parameter count, and neither is an architecture-only comparison to pretrained YOLO11n.
 
 ### Image Processing Techniques
 
@@ -164,6 +166,38 @@ python eval_faster_rcnn_kfold_cv.py --data-root cv-data/my-dataset --run-root ru
 
 Use `--dry-run` with either script to inspect detected folds and commands without starting training or evaluation.
 
+### External PASCAL VOC 2007 benchmark
+
+`prepare_voc2007.py` downloads the official VOC 2007 train/validation and test archives into ignored `candidate-data/pascal-voc-2007/`, then creates an ignored strict-label benchmark at `processed-candidate-data/pascal-voc-2007/official/`. It preserves the official `2,501 / 2,510 / 4,952` train/validation/test image IDs and canonical 20-class order. It excludes XML objects marked `difficult=1`, preserves original JPEG pixels, uses hardlinks where possible, and writes a conversion audit to `voc2007_summary.json`.
+
+```bash
+python prepare_voc2007.py --raw-root candidate-data/pascal-voc-2007 --output-root processed-candidate-data/pascal-voc-2007/official --overwrite
+```
+
+This is a project-metric external benchmark, **not** an official VOC leaderboard protocol: the project metric implementation does not support VOC difficult-object ignores. The frozen scratch comparison uses the capacity-matched pair YOLO26 `l` (27.08M parameters) and Faster R-CNN `s` (28.87M parameters), at 640 pixels, batch size 8, seed 42, 100 epochs, AdamW (`lr=1e-4`, `weight_decay=5e-4`), direct YOLO regression, no focal loss, no class weights/sampler/augmentation, and project NMS defaults. Train using official `train`, select with official `valid`, and evaluate official `test` only once after both models are frozen.
+
+The conversion and 640-pixel batch-8 CUDA resource smokes are complete. The frozen scratch YOLO26 `l` run selected epoch 14 by validation loss and reached validation mAP50 $0.1450$, mAP50–95 $0.0567$, precision $0.6276$, and recall $0.0772$ at confidence $0.25$. Under the same frozen protocol, scratch Faster R-CNN `s` reached validation mAP50 $0.0723$, mAP50–95 $0.0278$, precision $0.1974$, and recall $0.1327$. On the single frozen official test evaluation, YOLO26 reached mAP50 $0.1318$, mAP50–95 $0.0527$, precision $0.5958$, and recall $0.0824$; Faster R-CNN reached mAP50 $0.0726$, mAP50–95 $0.0292$, precision $0.2094$, and recall $0.1514$. YOLO26 has stronger AP and precision, while Faster R-CNN has higher fixed-threshold recall. These are project-metric from-scratch results, not official VOC scores: difficult objects were excluded and no further VOC tuning or test evaluation is permitted.
+
+VOC 2007 uses official train/validation/test folders rather than `fold_<n>` directories, so use the **one-fold primitives**, not the K-fold runners. Run the models sequentially rather than concurrently on one GPU.
+
+```bash
+# YOLO26 l: train on official train and select best.pt by official validation loss.
+python train_yolo26.py --data-root processed-candidate-data/pascal-voc-2007/official --epochs 100 --batch-size 8 --imgsz 640 --lr 1e-4 --weight-decay 5e-4 --workers 0 --fraction 1.0 --seed 42 --device cuda --scale l --num-classes 20 --box-gain 7.5 --cls-gain 0.5 --reg-gain 1.5 --reg-max 1 --one2many-topk 10 --one2one-topk 1 --focal-gamma 0 --class-positive-weight-power 0 --balanced-sampling-power 1.0 --save-dir runs/yolo26/voc2007_official_imgsz640_yolo26l_scratch_seed42_e100
+
+# Faster R-CNN s: run on the other PC under the unchanged frozen protocol.
+python train_faster_rcnn.py --data-root processed-candidate-data/pascal-voc-2007/official --epochs 100 --batch-size 8 --imgsz 640 --lr 1e-4 --weight-decay 5e-4 --workers 0 --fraction 1.0 --seed 42 --device cuda --scale s --num-classes 20 --class-positive-weight-power 0 --balanced-sampling-power 1.0 --save-dir runs/faster_rcnn/voc2007_official_imgsz640_frcnns_scratch_seed42_e100
+```
+
+Evaluate each frozen checkpoint on official validation data:
+
+```bash
+python eval_yolo26.py --checkpoint runs/yolo26/voc2007_official_imgsz640_yolo26l_scratch_seed42_e100/best.pt --data-root processed-candidate-data/pascal-voc-2007/official --split valid --batch-size 8 --imgsz 640 --workers 0 --fraction 1.0 --device cuda --conf-thresh 0.25 --postprocess class_aware_nms --nms-iou 0.70 --nms-score-thresh 0.001 --max-det 300 --metrics-output runs/yolo26/voc2007_official_imgsz640_yolo26l_scratch_seed42_e100/valid_metrics.json
+
+python eval_faster_rcnn.py --checkpoint runs/faster_rcnn/voc2007_official_imgsz640_frcnns_scratch_seed42_e100/best.pt --data-root processed-candidate-data/pascal-voc-2007/official --split valid --batch-size 8 --imgsz 640 --workers 0 --fraction 1.0 --device cuda --conf-thresh 0.25 --nms-iou 0.70 --nms-score-thresh 0.001 --max-det 300 --metrics-output runs/faster_rcnn/voc2007_official_imgsz640_frcnns_scratch_seed42_e100/valid_metrics.json
+```
+
+The two frozen `best.pt` checkpoints have now each been evaluated exactly once on official test with the listed settings. Do not use those test results to choose another configuration, and do not rerun any VOC training or test evaluation.
+
 ## Environment Setup
 
 Use separate environments for preprocessing and custom YOLO26 training.
@@ -176,20 +210,20 @@ Use this for dataset preprocessing and general project scripts.
 pip install -r requirements.txt
 ```
 
-### Option B: Dedicated GPU Environment for Custom YOLO26 Training
+### Option B: Dedicated GPU Environment for Custom Detection Training
 
-Use the `yolo26` Conda environment for custom GPU training so PyTorch and CUDA do not conflict with other project dependencies.
+Use the `3dprint-det` Conda environment for custom GPU training so PyTorch and CUDA do not conflict with other project dependencies.
 
 Create the environment:
 
 ```bash
-conda create -n yolo26 python=3.11 -y
+conda create -n 3dprint-det python=3.10 -y
 ```
 
 Activate it:
 
 ```bash
-conda activate yolo26
+conda activate 3dprint-det
 ```
 
 Upgrade pip:

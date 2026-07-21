@@ -47,6 +47,8 @@ def build_eval_command(
         str(args.fraction),
         "--conf-thresh",
         str(args.conf_thresh),
+        "--inference-branch",
+        args.inference_branch,
         "--postprocess",
         args.postprocess,
         "--nms-iou",
@@ -184,6 +186,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--conf-thresh", type=float, default=0.25)
     parser.add_argument(
+        "--inference-branch",
+        choices=["one2one", "one2many"],
+        default="one2one",
+        help="Raw detection branch passed to eval_yolo26.py; one2one preserves historical reports",
+    )
+    parser.add_argument(
         "--postprocess",
         choices=["legacy_topk", "class_aware_nms"],
         default="class_aware_nms",
@@ -211,6 +219,8 @@ def main() -> None:
         raise ValueError("--nms-score-thresh must be in [0, 1]")
     if args.max_det <= 0:
         raise ValueError("--max-det must be positive")
+    if args.postprocess == "legacy_topk" and args.inference_branch != "one2one":
+        raise ValueError("--postprocess legacy_topk is available only for --inference-branch one2one")
     if not args.data_root.is_dir():
         raise FileNotFoundError(f"Data root does not exist: {args.data_root}")
 
@@ -221,7 +231,7 @@ def main() -> None:
         project_path(args.output)
         if args.output is not None
         else args.run_root
-        / f"cv_evaluation_{args.split}_{args.postprocess}_conf_{confidence_tag(args.conf_thresh)}.json"
+        / f"cv_evaluation_{args.split}_{args.inference_branch}_{args.postprocess}_conf_{confidence_tag(args.conf_thresh)}.json"
     )
 
     per_fold: list[dict[str, Any]] = []
@@ -229,7 +239,7 @@ def main() -> None:
         fold_root = fold_roots[fold]
         checkpoint = render_fold_path(args.run_root, args.checkpoint_template, fold)
         metrics_output = checkpoint.parent / (
-            f"{args.split}_metrics_{args.postprocess}_conf_{confidence_tag(args.conf_thresh)}.json"
+            f"{args.split}_metrics_{args.inference_branch}_{args.postprocess}_conf_{confidence_tag(args.conf_thresh)}.json"
         )
         command = build_eval_command(args, checkpoint, fold_root, metrics_output)
         print(f"\n===== CUSTOM YOLO26 EVALUATE FOLD {fold}/{len(folds)} =====", flush=True)
@@ -264,6 +274,7 @@ def main() -> None:
         "confidence_threshold": args.conf_thresh,
         "postprocessing": {
             "mode": args.postprocess,
+            "inference_branch": args.inference_branch,
             "nms_iou": args.nms_iou,
             "nms_score_threshold": args.nms_score_thresh,
             "max_detections": args.max_det,

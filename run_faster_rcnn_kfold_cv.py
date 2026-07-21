@@ -29,6 +29,8 @@ def training_settings(args: argparse.Namespace, num_classes: int) -> dict[str, A
         "seed": args.seed,
         "device": args.device,
         "scale": args.scale,
+        "backbone_weights": args.backbone_weights,
+        "backbone_lr_multiplier": args.backbone_lr_multiplier,
         "num_classes": num_classes,
         "class_positive_weight_power": args.class_positive_weight_power,
         "balanced_sampling": args.balanced_sampling,
@@ -67,6 +69,10 @@ def build_train_command(
         args.device,
         "--scale",
         args.scale,
+        "--backbone-weights",
+        args.backbone_weights,
+        "--backbone-lr-multiplier",
+        str(args.backbone_lr_multiplier),
         "--num-classes",
         str(num_classes),
         "--class-positive-weight-power",
@@ -197,6 +203,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--scale", choices=["s", "m", "l"], default="m")
+    parser.add_argument("--backbone-weights", choices=["none", "imagenet"], default="none")
+    parser.add_argument("--backbone-lr-multiplier", type=float, default=1.0)
     parser.add_argument("--class-positive-weight-power", type=float, default=0.0)
     parser.add_argument("--balanced-sampling", action="store_true")
     parser.add_argument("--balanced-sampling-power", type=float, default=1.0)
@@ -224,6 +232,10 @@ def main() -> None:
         raise ValueError("--class-positive-weight-power must be in [0, 1]")
     if not 0.0 <= args.balanced_sampling_power <= 1.0:
         raise ValueError("--balanced-sampling-power must be in [0, 1]")
+    if not 0.0 < args.backbone_lr_multiplier <= 1.0:
+        raise ValueError("--backbone-lr-multiplier must be in (0, 1]")
+    if args.backbone_weights == "imagenet" and args.scale not in {"s", "m"}:
+        raise ValueError("--backbone-weights imagenet supports only --scale s or m")
     if not args.data_root.is_dir():
         raise FileNotFoundError(f"Data root does not exist: {args.data_root}")
 

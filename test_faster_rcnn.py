@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import torch
+from torchvision.models import resnet18
 
 from models.faster_rcnn import (
     RPN_FORCE_MATCH_TOPK,
+    ResNetBackbone,
     _assign_levels,
     assign_rpn_targets,
     build_faster_rcnn,
@@ -53,6 +55,15 @@ def test_rpn_target_assignment() -> None:
     empty_labels, empty_matches = assign_rpn_targets(anchors, torch.zeros((0, 4)))
     assert empty_matches is None
     assert torch.equal(empty_labels, torch.zeros_like(empty_labels))
+
+
+def test_torchvision_resnet_mapping() -> None:
+    """Verify ResNet-18 state keys map exactly into the local small backbone."""
+    source = resnet18(weights=None)
+    backbone = ResNetBackbone([64, 128, 256, 512], [2, 2, 2, 2])
+    backbone.load_torchvision_resnet_state(source.state_dict())
+    assert torch.equal(backbone.stem[0].weight, source.conv1.weight)
+    assert torch.equal(backbone.stage2[0].shortcut[0].weight, source.layer2[0].downsample[0].weight)
 
 
 def test_model_train_validation_and_inference() -> None:
@@ -107,6 +118,8 @@ def main() -> None:
     print("fpn_level_assignment: passed")
     test_rpn_target_assignment()
     print("rpn_target_assignment: passed")
+    test_torchvision_resnet_mapping()
+    print("torchvision_resnet_mapping: passed")
     test_model_train_validation_and_inference()
     print("faster_rcnn_model_smoke: passed")
 

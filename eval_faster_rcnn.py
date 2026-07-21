@@ -207,6 +207,12 @@ def main() -> None:
 
     scale, imgsz = _resolve_evaluation_settings(checkpoint, args)
     class_positive_weights = _load_positive_class_weights(checkpoint, num_classes)
+    saved_args = checkpoint.get("args", {})
+    if not isinstance(saved_args, dict):
+        saved_args = {}
+    backbone_weights = str(saved_args.get("backbone_weights", "none"))
+    backbone_lr_multiplier = float(saved_args.get("backbone_lr_multiplier", 1.0))
+    backbone_initialization = str(checkpoint.get("backbone_initialization", "random"))
 
     model = build_faster_rcnn(
         nc=num_classes,
@@ -285,6 +291,9 @@ def main() -> None:
             "evaluation_settings": {
                 "scale": scale,
                 "imgsz": imgsz,
+                "backbone_weights": backbone_weights,
+                "backbone_initialization": backbone_initialization,
+                "backbone_lr_multiplier": backbone_lr_multiplier,
                 "class_names": class_names,
                 "positive_class_weights": class_positive_weights.tolist(),
                 "postprocess": "per_class_nms",
@@ -299,6 +308,7 @@ def main() -> None:
 
     print(
         f"Evaluation settings: scale={scale} imgsz={imgsz} "
+        f"backbone_weights={backbone_weights} backbone_initialization={backbone_initialization} "
         f"postprocess=per_class_nms nms_iou={args.nms_iou:g} "
         f"nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det}"
     )

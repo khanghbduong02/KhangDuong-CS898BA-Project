@@ -55,6 +55,10 @@ def main() -> None:
 	print("one_to_one:", tuple(outputs["one_to_one"].shape))
 	assert outputs["one_to_many"].shape == (1, 7, 8400)
 	assert outputs["one_to_one"].shape == (1, 300, 6)
+	decoded_one2many = model.detect.decode_branch(outputs["one2many"])
+	decoded_one2one = model.detect.decode_branch(outputs["one2one"])
+	assert decoded_one2many.shape == (1, 7, 8400)
+	assert torch.allclose(decoded_one2one, outputs["decoded"])
 
 	dfl_model = build_yolo26(nc=5, scale="n", topk=300, reg_max=16)
 	dfl_model.eval()
@@ -64,6 +68,7 @@ def main() -> None:
 	assert dfl_outputs["decoded"].shape == (1, 9, 8400)
 	assert dfl_outputs["one_to_one"].shape == (1, 300, 6)
 	assert torch.isfinite(dfl_outputs["decoded"]).all()
+	assert dfl_model.detect.decode_branch(dfl_outputs["one2many"]).shape == (1, 9, 8400)
 	print("distributional_head:", tuple(dfl_outputs["one_to_many"].shape))
 
 	test_class_aware_nms()

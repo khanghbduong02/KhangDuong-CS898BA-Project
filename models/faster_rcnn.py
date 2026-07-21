@@ -17,7 +17,7 @@ Head     : 2× FC → cls (nc+1) + class-agnostic box regression
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -142,6 +142,85 @@ class ResNetBackbone(nn.Module):
         c4 = self.stage3(c3)   # stride 16
         c5 = self.stage4(c4)   # stride 32
         return c3, c4, c5
+
+    @staticmethod
+    def _map_torchvision_resnet_key(source_key: str) -> str | None:
+        """Map a torchvision ResNet stem/stage key into this local backbone."""
+        if source_key.startswith("fc."):
+            return None
+        if source_key.startswith("conv1."):
+            return f"stem.0.{source_key.removeprefix('conv1.')}"
+        if source_key.startswith("bn1."):
+            return f"stem.1.{source_key.removeprefix('bn1.')}"
+
+        stage_map = {
+            "layer1.": "stage1.",
+            "layer2.": "stage2.",
+            "layer3.": "stage3.",
+            "layer4.": "stage4.",
+        }
+        for source_prefix, target_prefix in stage_map.items():
+            if source_key.startswith(source_prefix):
+                suffix = source_key.removeprefix(source_prefix).replace(".downsample.", ".shortcut.")
+                return f"{target_prefix}{suffix}"
+        return None
+
+    def load_torchvision_resnet_state(self, source_state: Mapping[str, torch.Tensor]) -> None:
+        """Load a shape-compatible torchvision ResNet state into the local stem/stages."""
+        target_state = self.state_dict()
+        mapped_state: dict[str, torch.Tensor] = {}
+        for source_key, value in source_state.items():
+            target_key = self._map_torchvision_resnet_key(source_key)
+            if target_key is None:
+                continue
+            if target_key not in target_state:
+                raise ValueError(f"Torchvision ResNet key {source_key!r} maps to unknown key {target_key!r}")
+            if target_state[target_key].shape != value.shape:
+                raise ValueError(
+                    f"Torchvision ResNet tensor {source_key!r} shape {tuple(value.shape)} does not match "
+                    f"local tensor {target_key!r} shape {tuple(target_state[target_key].shape)}"
+                )
+            mapped_state[target_key] = value.detach().to(dtype=target_state[target_key].dtype)
+
+        missing = sorted(set(target_state) - set(mapped_state))
+        if missing:
+            raise ValueError(
+                "Torchvision ResNet state is incomplete for the local backbone; "
+                f"missing keys include {missing[:5]}"
+            )
+        self.load_state_dict(mapped_state, strict=True)
+
+    def load_imagenet_weights(self, scale: str) -> str:
+        """Initialize a compatible local backbone from torchvision ImageNet weights.
+
+        ``s`` maps to ResNet-18 and ``m`` maps to ResNet-34 because both use
+        the BasicBlock layout of this local implementation. The wider local
+        ``l`` architecture has no compatible torchvision ImageNet state.
+        """
+        try:
+            from torchvision.models import (
+                ResNet18_Weights,
+                ResNet34_Weights,
+                resnet18,
+                resnet34,
+            )
+        except ImportError as exc:
+            raise RuntimeError("ImageNet backbone initialization requires torchvision.models") from exc
+
+        if scale == "s":
+            source = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+            source_name = "torchvision_resnet18_imagenet1k_v1"
+        elif scale == "m":
+            source = resnet34(weights=ResNet34_Weights.IMAGENET1K_V1)
+            source_name = "torchvision_resnet34_imagenet1k_v1"
+        else:
+            raise ValueError(
+                "ImageNet backbone initialization supports scale 's' (ResNet-18) or 'm' (ResNet-34), "
+                f"not {scale!r}"
+            )
+
+        self.load_torchvision_resnet_state(source.state_dict())
+        return source_name
 
 
 # ===========================================================================
@@ -578,6 +657,7 @@ class FasterRCNN(nn.Module):
         score_threshold: float = DEFAULT_SCORE_THRESH,
         nms_threshold: float = DEFAULT_NMS_THRESH,
         max_detections: int = DEFAULT_DETECTIONS_MAX,
+        backbone_initialization: str = "random",
     ) -> None:
         super().__init__()
         if num_classes < 2:
@@ -589,6 +669,7 @@ class FasterRCNN(nn.Module):
         self.num_classes = num_classes   # includes background (index 0)
         self.min_size    = min_size
         self.max_size    = max_size
+        self.backbone_initialization = backbone_initialization
 
         self.register_buffer(
             "pixel_mean", torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -855,6 +936,7 @@ def build_faster_rcnn(
     score_threshold: float = DEFAULT_SCORE_THRESH,
     nms_threshold: float = DEFAULT_NMS_THRESH,
     max_detections: int = DEFAULT_DETECTIONS_MAX,
+    backbone_weights: str = "none",
 ) -> FasterRCNN:
     """Build a fully custom Faster R-CNN.
 
@@ -868,6 +950,8 @@ def build_faster_rcnn(
         score_threshold: Candidate score floor before per-class NMS.
         nms_threshold: Per-class NMS IoU threshold.
         max_detections: Maximum detections retained per image after NMS.
+        backbone_weights: ``none`` for random initialization, or ``imagenet``
+            for a torchvision ImageNet-initialized compatible backbone.
 
     Returns:
         A :class:`FasterRCNN` with randomly initialised weights, no external
@@ -879,6 +963,8 @@ def build_faster_rcnn(
         raise ValueError("min_size and max_size must be positive")
     if scale not in SCALE_CONFIG:
         raise ValueError(f"Unknown scale '{scale}'. Choose from {list(SCALE_CONFIG.keys())}.")
+    if backbone_weights not in {"none", "imagenet"}:
+        raise ValueError("backbone_weights must be 'none' or 'imagenet'")
 
     if class_positive_weights is None:
         class_weights = torch.ones(nc + 1, dtype=torch.float32)
@@ -897,6 +983,9 @@ def build_faster_rcnn(
 
     channels, blocks = SCALE_CONFIG[scale]
     backbone = ResNetBackbone(channels, blocks)
+    backbone_initialization = "random"
+    if backbone_weights == "imagenet":
+        backbone_initialization = backbone.load_imagenet_weights(scale)
     fpn      = FPN(backbone.out_channels, FPN_CHANNELS)
     rpn      = RPN(FPN_CHANNELS)
     head     = DetectionHead(FPN_CHANNELS, ROI_OUTPUT_SIZE, nc + 1)
@@ -913,4 +1002,5 @@ def build_faster_rcnn(
         score_threshold=score_threshold,
         nms_threshold=nms_threshold,
         max_detections=max_detections,
+        backbone_initialization=backbone_initialization,
     )

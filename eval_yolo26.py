@@ -41,6 +41,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--one2one-topk", type=int, default=None, help="Task-aligned top-k for one-to-one assignment; defaults to the saved checkpoint value")
     parser.add_argument("--conf-thresh", type=float, default=0.25, help="Confidence threshold used for precision/recall summary")
     parser.add_argument(
+        "--inference-branch",
+        choices=["one2one", "one2many"],
+        default="one2one",
+        help=(
+            "Raw detection branch used for inference. one2one preserves historical reports; "
+            "one2many must be validated separately with class-aware NMS."
+        ),
+    )
+    parser.add_argument(
         "--postprocess",
         choices=["legacy_topk", "class_aware_nms"],
         default="class_aware_nms",
@@ -129,6 +138,8 @@ def main() -> None:
         raise ValueError("--nms-score-thresh must be in [0, 1]")
     if args.max_det <= 0:
         raise ValueError("--max-det must be positive")
+    if args.postprocess == "legacy_topk" and args.inference_branch != "one2one":
+        raise ValueError("--postprocess legacy_topk is available only for the historical one2one branch")
 
     split_root = args.data_root / args.split
     if not split_root.exists():
@@ -196,6 +207,7 @@ def main() -> None:
         f"Evaluation settings: scale={scale} box_gain={box_gain:g} cls_gain={cls_gain:g} focal_gamma={focal_gamma:g} "
         f"reg_gain={reg_gain:g} reg_max={reg_max} one2many_topk={one2many_topk} one2one_topk={one2one_topk} "
         f"positive_class_weights=({class_weight_summary}) postprocess={args.postprocess} "
+        f"inference_branch={args.inference_branch} "
         f"nms_iou={args.nms_iou:g} nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det}"
     )
     model.eval()
@@ -229,10 +241,11 @@ def main() -> None:
             if args.postprocess == "legacy_topk":
                 batch_preds = [prediction.detach().cpu() for prediction in outputs["one_to_one"]]
             else:
+                decoded = model.detect.decode_branch(outputs[args.inference_branch])
                 batch_preds = [
                     prediction.detach().cpu()
                     for prediction in class_aware_nms(
-                        outputs["decoded"],
+                        decoded,
                         num_classes=num_classes,
                         score_threshold=args.nms_score_thresh,
                         iou_threshold=args.nms_iou,
@@ -287,6 +300,7 @@ def main() -> None:
                 "positive_class_weights": class_positive_weights.detach().cpu().tolist(),
                 "class_names": class_names,
                 "postprocess": args.postprocess,
+                "inference_branch": args.inference_branch,
                 "nms_iou": args.nms_iou,
                 "nms_score_threshold": args.nms_score_thresh,
                 "max_detections": args.max_det,

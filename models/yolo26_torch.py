@@ -436,6 +436,15 @@ class Detect(nn.Module):
         return outputs  # type: ignore[return-value]
 
     def _inference(self, preds: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return self.decode_branch(preds)
+
+    def decode_branch(self, preds: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode either raw detection branch into pixel XYXY boxes and class scores.
+
+        The one-to-many and one-to-one branches share the same output contract.
+        Exposing this decoder lets evaluation choose a branch explicitly while
+        preserving the historical one-to-one default in ``forward``.
+        """
         boxes = self._get_decode_boxes(preds)
         return torch.cat((boxes, preds["scores"].sigmoid()), dim=1)
 

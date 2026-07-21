@@ -321,6 +321,39 @@ def run_epoch(
     return total / n, cls / n, box / n
 
 
+def build_optimizer(
+    model: torch.nn.Module,
+    lr: float,
+    weight_decay: float,
+    backbone_lr_multiplier: float,
+) -> AdamW:
+    """Create AdamW groups with an optional lower rate for a pretrained backbone."""
+    if lr <= 0.0 or weight_decay < 0.0:
+        raise ValueError("Learning rate must be positive and weight decay must be non-negative")
+    if not 0.0 < backbone_lr_multiplier <= 1.0:
+        raise ValueError("backbone_lr_multiplier must be in (0, 1]")
+    if not hasattr(model, "backbone"):
+        raise ValueError("Faster R-CNN model must expose a backbone for optimizer grouping")
+
+    backbone_parameters = [parameter for parameter in model.backbone.parameters() if parameter.requires_grad]
+    backbone_ids = {id(parameter) for parameter in backbone_parameters}
+    detector_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in backbone_ids
+    ]
+    if not backbone_parameters or not detector_parameters:
+        raise ValueError("Expected both backbone and detector parameters")
+
+    return AdamW(
+        [
+            {"params": backbone_parameters, "lr": lr * backbone_lr_multiplier},
+            {"params": detector_parameters, "lr": lr},
+        ],
+        weight_decay=weight_decay,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -366,6 +399,18 @@ def parse_args() -> argparse.Namespace:
         choices=["s", "m", "l"],
         help="Model size: s=small, m=medium, l=large (same as --scale in YOLO26).",
     )
+    parser.add_argument(
+        "--backbone-weights",
+        choices=["none", "imagenet"],
+        default="none",
+        help="Backbone initialization: random local weights or compatible torchvision ImageNet weights",
+    )
+    parser.add_argument(
+        "--backbone-lr-multiplier",
+        type=float,
+        default=1.0,
+        help="Backbone learning-rate multiplier; use a smaller value such as 0.1 for ImageNet transfer learning",
+    )
     parser.add_argument("--num-classes", type=int, default=None,
                         help="Override number of classes (default: read from data.yaml).")
     parser.add_argument(
@@ -395,6 +440,10 @@ def main() -> None:
         raise ValueError("--class-positive-weight-power must be in [0, 1]")
     if not 0.0 <= args.balanced_sampling_power <= 1.0:
         raise ValueError("--balanced-sampling-power must be in [0, 1]")
+    if not 0.0 < args.backbone_lr_multiplier <= 1.0:
+        raise ValueError("--backbone-lr-multiplier must be in (0, 1]")
+    if args.backbone_weights == "imagenet" and args.scale not in {"s", "m"}:
+        raise ValueError("--backbone-weights imagenet supports only --scale s or m")
 
     device = torch.device(args.device)
     args.data_root = args.data_root.resolve()
@@ -469,15 +518,26 @@ def main() -> None:
         min_size=args.imgsz,
         max_size=args.imgsz,
         class_positive_weights=class_positive_weights,
+        backbone_weights=args.backbone_weights,
     ).to(device)
 
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = build_optimizer(
+        model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        backbone_lr_multiplier=args.backbone_lr_multiplier,
+    )
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     print(
         f"Training custom Faster R-CNN on device={device}, train_images={len(train_dataset)}, "
-        f"valid_images={len(valid_dataset)}, seed={args.seed}, scale={args.scale}"
+        f"valid_images={len(valid_dataset)}, seed={args.seed}, scale={args.scale}, "
+        f"backbone_weights={args.backbone_weights}"
+    )
+    print(
+        f"Backbone initialization={model.backbone_initialization} "
+        f"backbone_lr_multiplier={args.backbone_lr_multiplier:g}"
     )
     print(f"Dataset classes: nc={num_classes} names={class_names}")
     class_count_summary = ", ".join(
@@ -532,6 +592,7 @@ def main() -> None:
             "class_box_counts": class_box_counts,
             "class_positive_weights": class_positive_weights.detach().cpu(),
             "model_inference_settings": model.inference_settings(),
+            "backbone_initialization": model.backbone_initialization,
         }
         torch.save(checkpoint, last_path)
         if val_loss < best_val:
