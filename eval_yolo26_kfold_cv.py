@@ -188,8 +188,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--inference-branch",
         choices=["one2one", "one2many"],
-        default="one2one",
-        help="Raw detection branch passed to eval_yolo26.py; one2one preserves historical reports",
+        default=None,
+        help=(
+            "Raw detection branch passed to eval_yolo26.py. Defaults to one2many with class-aware NMS; "
+            "one2one reproduces historical reports."
+        ),
     )
     parser.add_argument(
         "--postprocess",
@@ -207,6 +210,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.inference_branch is None:
+        args.inference_branch = "one2one" if args.postprocess == "legacy_topk" else "one2many"
     args.data_root = project_path(args.data_root)
     args.run_root = project_path(args.run_root)
     if args.batch_size <= 0 or args.imgsz <= 0 or args.workers < 0 or not 0.0 < args.fraction <= 1.0:

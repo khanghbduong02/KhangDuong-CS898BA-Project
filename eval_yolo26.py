@@ -43,10 +43,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--inference-branch",
         choices=["one2one", "one2many"],
-        default="one2one",
+        default=None,
         help=(
-            "Raw detection branch used for inference. one2one preserves historical reports; "
-            "one2many must be validated separately with class-aware NMS."
+            "Raw detection branch used for inference. Defaults to one2many with class-aware NMS; "
+            "one2one reproduces historical reports."
         ),
     )
     parser.add_argument(
@@ -127,6 +127,9 @@ def _load_positive_class_weights(
 
 def main() -> None:
     args = parse_args()
+
+    if args.inference_branch is None:
+        args.inference_branch = "one2one" if args.postprocess == "legacy_topk" else "one2many"
 
     if not torch.cuda.is_available() and args.device.startswith("cuda"):
         raise RuntimeError("CUDA device requested but no GPU is available to PyTorch.")

@@ -70,7 +70,7 @@ This repository includes a local PyTorch YOLO26-style architecture based on the 
 * `models/yolo26_torch.py` defines the backbone, PAN/FPN neck, C3k2, SPPF, C2PSA attention, dual one-to-many/one-to-one detection branches, class-aware NMS, and configurable direct/DFL-style box decoding.
 * `test.py` runs a forward-pass smoke test and prints output tensor shapes.
 * `train_yolo26.py` trains the model from scratch using Task-Aligned Assignment, focal/BCE classification loss, direct or distributional (DFL) box regression, AdamW, AMP, and gradient clipping.
-* `eval_yolo26.py` evaluates a saved checkpoint on validation or test data.
+* `eval_yolo26.py` evaluates a saved checkpoint on validation or test data and can explicitly decode the one-to-many or historical one-to-one branch.
 * `detection_metrics.py` computes AP, mAP50, mAP50-95, precision, recall, per-class metrics, and a detection confusion matrix.
 
 Run the architecture smoke test:
@@ -123,7 +123,7 @@ Optional train-only minority-class augmentation supports horizontal flip, bright
 * Per-class AP50, AP50-95, precision, and recall
 * Detection confusion matrix with a background row/column for unmatched GT boxes and false-positive detections
 
-The evaluator performs decoded one-to-one-head inference over the selected split, then calculates dataset-level metrics after processing all images. All current split outputs remain preliminary because a later audit found duplicate content and annotation disagreement across the exported splits; the required group-disjoint protocol is tracked in [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md).
+The evaluator performs class-aware NMS over the selected raw detection branch, then calculates dataset-level metrics after processing all images. Standard class-aware-NMS evaluation now defaults to the validated full-gradient `one2many` branch; select `--inference-branch one2one` to reproduce historical branch reports, while `--postprocess legacy_topk` automatically uses the historical one-to-one path. All current split outputs remain preliminary because a later audit found duplicate content and annotation disagreement across the exported splits; the required group-disjoint protocol is tracked in [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md).
 
 ## Current Status
 
@@ -137,9 +137,9 @@ The same pretrained YOLO11n reference also substantially outperformed the fixed 
 
 That 960-pixel custom ablation is now complete. It improved aggregate custom performance to mAP50 $0.0782 \pm 0.0161$ and mAP50-95 $0.0259 \pm 0.0065$, with all three folds improving aggregate mAP relative to the 640-pixel custom baseline. The gain is not uniform: Warping and Over Extrusion improve, while Stringing declines. Therefore 960 is retained only as an aggregate-mAP candidate configuration; no further resolution or hyperparameter sweep is planned.
 
-The fixed class-aware NMS diagnostic is now complete and requires no retraining. Applying class-aware NMS with IoU $0.70$, candidate score $0.001$, and at most 300 detections before top-$k$ truncation raises the 960 custom result to mAP50 $0.1127 \pm 0.0232$, mAP50-95 $0.0343 \pm 0.0076$, and precision $0.1621 \pm 0.0497$, with essentially unchanged recall at $0.0588 \pm 0.0172$. This is the current custom evaluation/inference decoder; use `--postprocess legacy_topk` only to reproduce historical reports. No further export-level sweeps are planned.
+The fixed class-aware NMS diagnostic first improved the historical one-to-one 960 result to mAP50 $0.1127 \pm 0.0232$ and mAP50-95 $0.0343 \pm 0.0076$. A later no-retraining three-fold branch diagnostic established that decoding the full-gradient one-to-many branch with the same NMS settings is stronger: mAP50 $0.1270 \pm 0.0210$, mAP50-95 $0.0420 \pm 0.0081$, precision $0.1153 \pm 0.0207$, and recall $0.1159 \pm 0.0246$. This is the selected custom evaluation/inference configuration. Use `--inference-branch one2one` or `--postprocess legacy_topk` only to reproduce historical reports. No further export-level sweeps are planned.
 
-A fixed three-fold DFL (`reg_max=16`) box-regression experiment was then evaluated with the same 960 input, focal/weight settings, NMS, batch size, seed, and epoch budget. It was rejected: mAP50 was $0.0802 \pm 0.0258$ and mAP50–95 was $0.0258 \pm 0.0093$, both below direct regression plus NMS. The DFL implementation and compatibility tests remain in the codebase as a documented negative architecture result; the selected custom head remains direct regression (`reg_max=1`).
+A fixed three-fold DFL (`reg_max=16`) box-regression experiment was then evaluated with the same 960 input, focal/weight settings, NMS, batch size, seed, and epoch budget under the historical one-to-one inference protocol. It was rejected: mAP50 was $0.0802 \pm 0.0258$ and mAP50–95 was $0.0258 \pm 0.0093$, both below historical direct regression plus NMS. The DFL implementation and compatibility tests remain in the codebase as a documented negative architecture result; the selected custom head remains direct regression (`reg_max=1`).
 
 ### Reusable K-fold cross-validation
 
