@@ -17,6 +17,7 @@ SCALE_CONFIG = {
     "x": (1.00, 1.50, 512),
 }
 STRIDES = (8.0, 16.0, 32.0)
+P2_STRIDES = (4.0, *STRIDES)
 
 
 def class_aware_nms(
@@ -366,16 +367,30 @@ class Detect(nn.Module):
     dynamic = False
     max_det = 300
 
-    def __init__(self, nc: int = 80, reg_max: int = 1, end2end: bool = True, ch: Tuple[int, int, int] = ()) -> None:
+    def __init__(
+        self,
+        nc: int = 80,
+        reg_max: int = 1,
+        end2end: bool = True,
+        ch: Tuple[int, ...] = (),
+        strides: Tuple[float, ...] | None = None,
+    ) -> None:
         super().__init__()
         if reg_max <= 0:
             raise ValueError("reg_max must be positive")
+        strides = STRIDES if strides is None else strides
+        if not ch:
+            raise ValueError("Detect requires at least one input feature channel")
+        if len(ch) != len(strides):
+            raise ValueError(
+                f"Detect received {len(ch)} feature channels but {len(strides)} strides"
+            )
         self.nc = nc
         self.nl = len(ch)
         self.reg_max = reg_max
         self.no = nc + self.reg_max * 4
         self.end2end = end2end
-        self.register_buffer("stride", torch.tensor(STRIDES, dtype=torch.float32), persistent=False)
+        self.register_buffer("stride", torch.tensor(strides, dtype=torch.float32), persistent=False)
         self.anchors = torch.empty(0)
         self.strides = torch.empty(0)
         self.shape: tuple[int, int, int, int] | None = None
@@ -491,6 +506,7 @@ class YOLO26Config:
     scale: str = "n"
     topk: int = 300
     reg_max: int = 1
+    use_p2: bool = False
 
 
 class YOLO26(nn.Module):
@@ -537,7 +553,30 @@ class YOLO26(nn.Module):
         self.h20 = Conv(c4, c4, 3, 2)
         self.h22 = C3k2(c4 + c5, c5, n=n1, c3k=True, e=0.5, attn=True)
 
-        self.detect = Detect(nc=cfg.nc, reg_max=cfg.reg_max, end2end=True, ch=(c3, c4, c5))
+        self.use_p2 = cfg.use_p2
+        if self.use_p2:
+            # Extend the top-down PAN path to stride 4, then feed the refined
+            # P2 feature back into P3 before the existing P4/P5 path. This
+            # preserves all historical P3--P5 channel contracts.
+            self.up3 = nn.Upsample(scale_factor=2, mode="nearest")
+            self.h25 = C3k2(c3 + c3, c2, n=n2, c3k=False, e=0.25)
+            self.h26 = Conv(c2, c3, 3, 2)
+            self.h28 = C3k2(c3 + c3, c3, n=n2, c3k=False, e=0.25)
+            self.detect = Detect(
+                nc=cfg.nc,
+                reg_max=cfg.reg_max,
+                end2end=True,
+                ch=(c2, c3, c4, c5),
+                strides=P2_STRIDES,
+            )
+        else:
+            self.detect = Detect(
+                nc=cfg.nc,
+                reg_max=cfg.reg_max,
+                end2end=True,
+                ch=(c3, c4, c5),
+                strides=STRIDES,
+            )
         self.detect.max_det = cfg.topk
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -561,6 +600,24 @@ class YOLO26(nn.Module):
         x15 = torch.cat((x14, x4), dim=1)
         x16 = self.h16(x15)
 
+        if self.use_p2:
+            x23 = self.up3(x16)
+            x24 = torch.cat((x23, x2), dim=1)
+            x25 = self.h25(x24)
+
+            x26 = self.h26(x25)
+            x27 = torch.cat((x26, x16), dim=1)
+            x28 = self.h28(x27)
+
+            x29 = self.h17(x28)
+            x30 = torch.cat((x29, x13), dim=1)
+            x31 = self.h19(x30)
+
+            x32 = self.h20(x31)
+            x33 = torch.cat((x32, x10), dim=1)
+            x34 = self.h22(x33)
+            return self.detect([x25, x28, x31, x34])
+
         x17 = self.h17(x16)
         x18 = torch.cat((x17, x13), dim=1)
         x19 = self.h19(x18)
@@ -572,5 +629,11 @@ class YOLO26(nn.Module):
         return self.detect([x16, x19, x22])
 
 
-def build_yolo26(nc: int = 3, scale: str = "n", topk: int = 300, reg_max: int = 1) -> YOLO26:
-    return YOLO26(YOLO26Config(nc=nc, scale=scale, topk=topk, reg_max=reg_max))
+def build_yolo26(
+    nc: int = 3,
+    scale: str = "n",
+    topk: int = 300,
+    reg_max: int = 1,
+    use_p2: bool = False,
+) -> YOLO26:
+    return YOLO26(YOLO26Config(nc=nc, scale=scale, topk=topk, reg_max=reg_max, use_p2=use_p2))

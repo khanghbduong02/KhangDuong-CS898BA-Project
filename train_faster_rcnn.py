@@ -20,6 +20,11 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from detection_metrics import xywhn_to_xyxy
 from models.faster_rcnn import build_faster_rcnn
+from training_control import (
+    PlateauEarlyStopping,
+    add_plateau_early_stopping_arguments,
+    plateau_early_stopping_config_from_args,
+)
 from yolo_dataset_config import read_yolo_dataset_config
 
 VALID_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -411,12 +416,18 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Backbone learning-rate multiplier; use a smaller value such as 0.1 for ImageNet transfer learning",
     )
+    parser.add_argument(
+        "--use-p2",
+        action="store_true",
+        help="Add a stride-4 P2 FPN/RPN level for small objects; changes the architecture and checkpoint shape",
+    )
     parser.add_argument("--num-classes", type=int, default=None,
                         help="Override number of classes (default: read from data.yaml).")
     parser.add_argument(
         "--save-dir", type=Path, default=Path("runs/faster_rcnn"),
         help="Output directory for best.pt and last.pt checkpoints.",
     )
+    add_plateau_early_stopping_arguments(parser)
     parser.add_argument("--dry-run", action="store_true", help="Validate data and configuration without training")
     return parser.parse_args()
 
@@ -444,6 +455,7 @@ def main() -> None:
         raise ValueError("--backbone-lr-multiplier must be in (0, 1]")
     if args.backbone_weights == "imagenet" and args.scale not in {"s", "m"}:
         raise ValueError("--backbone-weights imagenet supports only --scale s or m")
+    training_control_config = plateau_early_stopping_config_from_args(args)
 
     device = torch.device(args.device)
     args.data_root = args.data_root.resolve()
@@ -519,6 +531,7 @@ def main() -> None:
         max_size=args.imgsz,
         class_positive_weights=class_positive_weights,
         backbone_weights=args.backbone_weights,
+        use_p2=args.use_p2,
     ).to(device)
 
     optimizer = build_optimizer(
@@ -527,6 +540,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         backbone_lr_multiplier=args.backbone_lr_multiplier,
     )
+    training_control = PlateauEarlyStopping(optimizer, training_control_config)
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
@@ -537,7 +551,8 @@ def main() -> None:
     )
     print(
         f"Backbone initialization={model.backbone_initialization} "
-        f"backbone_lr_multiplier={args.backbone_lr_multiplier:g}"
+        f"backbone_lr_multiplier={args.backbone_lr_multiplier:g} "
+        f"use_p2={args.use_p2} feature_strides={model.feature_strides}"
     )
     print(f"Dataset classes: nc={num_classes} names={class_names}")
     class_count_summary = ", ".join(
@@ -551,6 +566,18 @@ def main() -> None:
         f"Positive class weighting: power={args.class_positive_weight_power:.2f} "
         f"box_counts=({class_count_summary}) weights=({class_weight_summary})"
     )
+    if training_control_config.enabled:
+        print(
+            "Training control: ReduceLROnPlateau "
+            f"patience={training_control_config.reduce_lr_patience} "
+            f"factor={training_control_config.reduce_lr_factor:g} "
+            f"cooldown={training_control_config.reduce_lr_cooldown} min_lr={training_control_config.min_lr:g}; "
+            "early stopping "
+            f"patience={training_control_config.early_stopping_patience} "
+            f"min_delta={training_control_config.early_stopping_min_delta:g}"
+        )
+    else:
+        print("Training control: ReduceLROnPlateau and early stopping disabled")
     if sampler_counts is not None:
         count_summary = ", ".join(
             f"class_{class_id}:{count}" for class_id, count in enumerate(sampler_counts)
@@ -578,8 +605,21 @@ def main() -> None:
             model, valid_loader, optimizer=None, scaler=scaler, device=device, use_amp=use_amp,
         )
 
+        is_best = val_loss < best_val
+        if is_best:
+            best_val = val_loss
+        control_step = training_control.step(val_loss)
+        training_completed = control_step.should_stop or epoch == args.epochs
+        stop_reason = (
+            "early_stopping"
+            if control_step.should_stop
+            else "max_epochs"
+            if epoch == args.epochs
+            else None
+        )
+
         checkpoint: Dict[str, Any] = {
-            "format_version": 2,
+            "format_version": 3,
             "model_name": "custom_faster_rcnn",
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -593,10 +633,14 @@ def main() -> None:
             "class_positive_weights": class_positive_weights.detach().cpu(),
             "model_inference_settings": model.inference_settings(),
             "backbone_initialization": model.backbone_initialization,
+            "best_val_loss": best_val,
+            "training_control": training_control.state_dict(),
+            "learning_rates": list(control_step.learning_rates),
+            "training_completed": training_completed,
+            "stop_reason": stop_reason,
         }
         torch.save(checkpoint, last_path)
-        if val_loss < best_val:
-            best_val = val_loss
+        if is_best:
             torch.save(checkpoint, best_path)
 
         history_record = {
@@ -608,15 +652,29 @@ def main() -> None:
             "val_cls_loss": val_cls,
             "val_box_loss": val_box,
             "best_val_loss": best_val,
+            "learning_rates": list(control_step.learning_rates),
+            "lr_reduced": control_step.lr_reduced,
+            "early_stopping_bad_epochs": control_step.bad_epochs,
+            "training_completed": training_completed,
+            "stop_reason": stop_reason,
         }
         with history_path.open("a", encoding="utf-8") as history_file:
             history_file.write(json.dumps(history_record) + "\n")
 
+        lr_text = "/".join(f"{lr:.2e}" for lr in control_step.learning_rates)
+        reduction_text = " lr_reduced=true" if control_step.lr_reduced else ""
         print(
             f"epoch={epoch}/{args.epochs} "
             f"train_loss={train_loss:.4f} train_cls={train_cls:.4f} train_box={train_box:.4f} "
-            f"val_loss={val_loss:.4f} val_cls={val_cls:.4f} val_box={val_box:.4f}"
+            f"val_loss={val_loss:.4f} val_cls={val_cls:.4f} val_box={val_box:.4f} "
+            f"lr={lr_text} early_stop_bad_epochs={control_step.bad_epochs}{reduction_text}"
         )
+        if control_step.should_stop:
+            print(
+                f"Early stopping at epoch={epoch}: validation loss did not improve for "
+                f"{training_control_config.early_stopping_patience} eligible epochs."
+            )
+            break
 
     print(f"Saved best checkpoint to {best_path}")
 

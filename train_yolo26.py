@@ -17,6 +17,11 @@ from ultralytics.utils.ops import xywh2xyxy
 from ultralytics.utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors
 
 from models.yolo26_torch import build_yolo26
+from training_control import (
+    PlateauEarlyStopping,
+    add_plateau_early_stopping_arguments,
+    plateau_early_stopping_config_from_args,
+)
 from yolo_dataset_config import read_yolo_dataset_config
 
 
@@ -333,7 +338,7 @@ class BranchDetectionLoss:
     def __init__(
         self,
         nc: int,
-        strides: Tuple[int, int, int],
+        strides: Tuple[int, ...],
         device: torch.device,
         box_gain: float,
         cls_gain: float,
@@ -463,7 +468,7 @@ class E2EDetectLoss:
     def __init__(
         self,
         nc: int,
-        strides: Tuple[int, int, int],
+        strides: Tuple[int, ...],
         device: torch.device,
         box_gain: float,
         cls_gain: float,
@@ -629,9 +634,15 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Box distance bins per side; 1 preserves direct regression, values above 1 enable DFL",
     )
+    parser.add_argument(
+        "--use-p2",
+        action="store_true",
+        help="Add a stride-4 P2 detection level for small objects; changes the architecture and checkpoint shape",
+    )
     parser.add_argument("--one2many-topk", type=int, default=10, help="Task-aligned top-k for one-to-many assignment")
     parser.add_argument("--one2one-topk", type=int, default=1, help="Task-aligned top-k for one-to-one assignment")
     parser.add_argument("--save-dir", type=Path, default=Path("runs/yolo26"), help="Output directory for checkpoints")
+    add_plateau_early_stopping_arguments(parser)
     return parser.parse_args()
 
 
@@ -662,6 +673,7 @@ def main() -> None:
         raise ValueError("--num-classes must be positive")
     if args.reg_max <= 0:
         raise ValueError("--reg-max must be positive")
+    training_control_config = plateau_early_stopping_config_from_args(args)
 
     train_dataset = YoloDetectionDataset(train_root, imgsz=args.imgsz, fraction=args.fraction)
     valid_dataset = YoloDetectionDataset(valid_root, imgsz=args.imgsz, fraction=args.fraction)
@@ -701,12 +713,19 @@ def main() -> None:
         collate_fn=collate_fn,
     )
 
-    model = build_yolo26(nc=args.num_classes, scale=args.scale, reg_max=args.reg_max).to(device)
+    model = build_yolo26(
+        nc=args.num_classes,
+        scale=args.scale,
+        reg_max=args.reg_max,
+        use_p2=args.use_p2,
+    ).to(device)
+    model_strides = tuple(int(stride) for stride in model.detect.stride.detach().cpu().tolist())
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    training_control = PlateauEarlyStopping(optimizer, training_control_config)
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
     criterion = E2EDetectLoss(
         nc=args.num_classes,
-        strides=STRIDES,
+        strides=model_strides,
         device=device,
         box_gain=args.box_gain,
         cls_gain=args.cls_gain,
@@ -739,6 +758,19 @@ def main() -> None:
     )
     print(f"Classification focal gamma={args.focal_gamma:g}")
     print(f"Box regression: reg_max={args.reg_max} ({'DFL' if args.reg_max > 1 else 'direct distances'})")
+    print(f"Detection feature strides={model_strides} use_p2={args.use_p2}")
+    if training_control_config.enabled:
+        print(
+            "Training control: ReduceLROnPlateau "
+            f"patience={training_control_config.reduce_lr_patience} "
+            f"factor={training_control_config.reduce_lr_factor:g} "
+            f"cooldown={training_control_config.reduce_lr_cooldown} min_lr={training_control_config.min_lr:g}; "
+            "early stopping "
+            f"patience={training_control_config.early_stopping_patience} "
+            f"min_delta={training_control_config.early_stopping_min_delta:g}"
+        )
+    else:
+        print("Training control: ReduceLROnPlateau and early stopping disabled")
     if sampler_counts is not None:
         count_summary = ", ".join(f"class_{class_id}:{count}" for class_id, count in enumerate(sampler_counts))
         print(
@@ -768,7 +800,21 @@ def main() -> None:
             use_amp=use_amp,
         )
 
+        is_best = val_loss < best_val
+        if is_best:
+            best_val = val_loss
+        control_step = training_control.step(val_loss)
+        training_completed = control_step.should_stop or epoch == args.epochs
+        stop_reason = (
+            "early_stopping"
+            if control_step.should_stop
+            else "max_epochs"
+            if epoch == args.epochs
+            else None
+        )
+
         checkpoint = {
+            "format_version": 2,
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -778,17 +824,30 @@ def main() -> None:
             "class_names": list(dataset_config.class_names),
             "class_box_counts": class_box_counts,
             "class_positive_weights": class_positive_weights.detach().cpu(),
+            "best_val_loss": best_val,
+            "training_control": training_control.state_dict(),
+            "learning_rates": list(control_step.learning_rates),
+            "training_completed": training_completed,
+            "stop_reason": stop_reason,
         }
         torch.save(checkpoint, last_path)
-        if val_loss < best_val:
-            best_val = val_loss
+        if is_best:
             torch.save(checkpoint, best_path)
 
+        lr_text = "/".join(f"{lr:.2e}" for lr in control_step.learning_rates)
+        reduction_text = " lr_reduced=true" if control_step.lr_reduced else ""
         print(
             f"epoch={epoch}/{args.epochs} "
             f"train_loss={train_loss:.4f} train_cls={train_cls:.4f} train_box={train_box:.4f} "
-            f"val_loss={val_loss:.4f} val_cls={val_cls:.4f} val_box={val_box:.4f}"
+            f"val_loss={val_loss:.4f} val_cls={val_cls:.4f} val_box={val_box:.4f} "
+            f"lr={lr_text} early_stop_bad_epochs={control_step.bad_epochs}{reduction_text}"
         )
+        if control_step.should_stop:
+            print(
+                f"Early stopping at epoch={epoch}: validation loss did not improve for "
+                f"{training_control_config.early_stopping_patience} eligible epochs."
+            )
+            break
 
     print(f"Saved best checkpoint to {best_path}")
 

@@ -78,6 +78,12 @@ def parse_args() -> argparse.Namespace:
         choices=["s", "m", "l"],
         help="Model size used during training (overridden by checkpoint metadata if present).",
     )
+    parser.add_argument(
+        "--use-p2",
+        action="store_true",
+        default=None,
+        help="Use the optional stride-4 P2 FPN/RPN level; defaults to the saved checkpoint value",
+    )
     parser.add_argument("--conf-thresh", type=float, default=0.25,
                         help="Confidence threshold for precision/recall/confusion matrix.")
     parser.add_argument("--num-classes", type=int, default=None,
@@ -106,7 +112,7 @@ def parse_args() -> argparse.Namespace:
 def _resolve_evaluation_settings(
     checkpoint: Dict[str, Any],
     args: argparse.Namespace,
-) -> tuple[str, int]:
+) -> tuple[str, int, bool]:
     """Use explicit CLI settings first, then checkpoint settings, then legacy defaults."""
     saved_args = checkpoint.get("args", {})
     if not isinstance(saved_args, dict):
@@ -114,11 +120,12 @@ def _resolve_evaluation_settings(
 
     scale = args.scale if args.scale is not None else str(saved_args.get("scale", "m"))
     imgsz = args.imgsz if args.imgsz is not None else int(saved_args.get("imgsz", 640))
+    use_p2 = bool(args.use_p2) if args.use_p2 is not None else bool(saved_args.get("use_p2", False))
     if scale not in {"s", "m", "l"}:
         raise ValueError(f"Resolved scale {scale!r} is not one of s, m, or l")
     if imgsz <= 0 or imgsz % 64 != 0:
         raise ValueError("Resolved imgsz must be positive and divisible by 64")
-    return scale, imgsz
+    return scale, imgsz, use_p2
 
 
 def _load_positive_class_weights(
@@ -205,7 +212,7 @@ def main() -> None:
             f"checkpoint={saved_names!r}, dataset={class_names!r}"
         )
 
-    scale, imgsz = _resolve_evaluation_settings(checkpoint, args)
+    scale, imgsz, use_p2 = _resolve_evaluation_settings(checkpoint, args)
     class_positive_weights = _load_positive_class_weights(checkpoint, num_classes)
     saved_args = checkpoint.get("args", {})
     if not isinstance(saved_args, dict):
@@ -223,6 +230,7 @@ def main() -> None:
         score_threshold=args.nms_score_thresh,
         nms_threshold=args.nms_iou,
         max_detections=args.max_det,
+        use_p2=use_p2,
     ).to(device)
     _load_model_state(model, checkpoint)
     model.eval()
@@ -294,6 +302,8 @@ def main() -> None:
                 "backbone_weights": backbone_weights,
                 "backbone_initialization": backbone_initialization,
                 "backbone_lr_multiplier": backbone_lr_multiplier,
+                "use_p2": use_p2,
+                "feature_strides": list(model.feature_strides),
                 "class_names": class_names,
                 "positive_class_weights": class_positive_weights.tolist(),
                 "postprocess": "per_class_nms",
@@ -307,7 +317,7 @@ def main() -> None:
         args.metrics_output.write_text(json.dumps(metrics_output, indent=2) + "\n", encoding="utf-8")
 
     print(
-        f"Evaluation settings: scale={scale} imgsz={imgsz} "
+        f"Evaluation settings: scale={scale} imgsz={imgsz} use_p2={use_p2} "
         f"backbone_weights={backbone_weights} backbone_initialization={backbone_initialization} "
         f"postprocess=per_class_nms nms_iou={args.nms_iou:g} "
         f"nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det}"

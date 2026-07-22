@@ -4,11 +4,15 @@ import torch
 from torchvision.models import resnet18
 
 from models.faster_rcnn import (
+    P2_ANCHOR_SIZES,
+    P2_ANCHOR_STRIDES,
     RPN_FORCE_MATCH_TOPK,
+    FPN,
     ResNetBackbone,
     _assign_levels,
     assign_rpn_targets,
     build_faster_rcnn,
+    generate_anchors,
 )
 
 
@@ -66,6 +70,64 @@ def test_torchvision_resnet_mapping() -> None:
     assert torch.equal(backbone.stage2[0].shortcut[0].weight, source.layer2[0].downsample[0].weight)
 
 
+def test_p2_fpn_assignment_and_model() -> None:
+    """Verify the optional small-object P2 path produces P2--P6 consistently."""
+    backbone = ResNetBackbone([64, 128, 256, 512], [2, 2, 2, 2])
+    fpn = FPN(backbone.out_channels_with_p2, use_p2=True)
+    with torch.no_grad():
+        c2, c3, c4, c5 = backbone(torch.rand(1, 3, 128, 128))
+        features = fpn(c2, c3, c4, c5)
+    assert [tuple(feature.shape[-2:]) for feature in features] == [
+        (32, 32),
+        (16, 16),
+        (8, 8),
+        (4, 4),
+        (2, 2),
+    ]
+    anchors = generate_anchors(features, strides=P2_ANCHOR_STRIDES, sizes=P2_ANCHOR_SIZES)
+    assert anchors.shape == (4092, 4)
+
+    boxes = torch.tensor(
+        [
+            [0.0, 0.0, 32.0, 32.0],
+            [0.0, 0.0, 112.0, 112.0],
+            [0.0, 0.0, 224.0, 224.0],
+            [0.0, 0.0, 448.0, 448.0],
+            [0.0, 0.0, 896.0, 896.0],
+        ]
+    )
+    assert _assign_levels(boxes, num_levels=5, min_level=2).tolist() == [0, 1, 2, 3, 4]
+
+    model = build_faster_rcnn(
+        nc=2,
+        scale="s",
+        min_size=128,
+        max_size=128,
+        use_p2=True,
+        score_threshold=0.001,
+        max_detections=30,
+    )
+    images = [torch.rand(3, 128, 128), torch.rand(3, 128, 128)]
+    targets = [
+        {
+            "boxes": torch.tensor([[12.0, 15.0, 40.0, 45.0]], dtype=torch.float32),
+            "labels": torch.tensor([1], dtype=torch.long),
+        },
+        {
+            "boxes": torch.tensor([[25.0, 30.0, 60.0, 70.0]], dtype=torch.float32),
+            "labels": torch.tensor([2], dtype=torch.long),
+        },
+    ]
+    model.train()
+    losses = model(images, targets, compute_losses=True)
+    assert torch.isfinite(sum(losses.values()))
+    model.eval()
+    with torch.no_grad():
+        predictions = model(images)
+    assert model.inference_settings()["use_p2"] is True
+    assert len(predictions) == len(images)
+
+
 def test_model_train_validation_and_inference() -> None:
     """Exercise finite loss/backprop, frozen validation BatchNorm, and NMS output."""
     model = build_faster_rcnn(
@@ -120,6 +182,8 @@ def main() -> None:
     print("rpn_target_assignment: passed")
     test_torchvision_resnet_mapping()
     print("torchvision_resnet_mapping: passed")
+    test_p2_fpn_assignment_and_model()
+    print("p2_fpn_assignment_and_model: passed")
     test_model_train_validation_and_inference()
     print("faster_rcnn_model_smoke: passed")
 

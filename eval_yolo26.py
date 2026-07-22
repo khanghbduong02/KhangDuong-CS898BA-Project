@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 
 from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
 from models.yolo26_torch import build_yolo26, class_aware_nms
-from train_yolo26 import E2EDetectLoss, STRIDES, YoloDetectionDataset, collate_fn, compute_loss
+from train_yolo26 import E2EDetectLoss, YoloDetectionDataset, collate_fn, compute_loss
 from yolo_dataset_config import read_yolo_dataset_config
 
 
@@ -36,6 +36,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Box distance bins per side; defaults to the saved checkpoint value or 1 for legacy checkpoints",
+    )
+    parser.add_argument(
+        "--use-p2",
+        action="store_true",
+        default=None,
+        help="Use the optional stride-4 P2 head; defaults to the saved checkpoint value",
     )
     parser.add_argument("--one2many-topk", type=int, default=None, help="Task-aligned top-k for one-to-many assignment; defaults to the saved checkpoint value")
     parser.add_argument("--one2one-topk", type=int, default=None, help="Task-aligned top-k for one-to-one assignment; defaults to the saved checkpoint value")
@@ -88,7 +94,7 @@ def parse_args() -> argparse.Namespace:
 def _resolve_evaluation_settings(
     checkpoint: Dict[str, object],
     args: argparse.Namespace,
-) -> Tuple[str, float, float, float, float, int, int, int]:
+) -> Tuple[str, float, float, float, float, int, int, int, bool]:
     """Use explicit CLI settings first, then checkpoint settings, then legacy defaults."""
     saved_args = checkpoint.get("args", {})
     if not isinstance(saved_args, dict):
@@ -102,7 +108,8 @@ def _resolve_evaluation_settings(
     reg_max = args.reg_max if args.reg_max is not None else int(saved_args.get("reg_max", 1))
     one2many_topk = args.one2many_topk if args.one2many_topk is not None else int(saved_args.get("one2many_topk", 10))
     one2one_topk = args.one2one_topk if args.one2one_topk is not None else int(saved_args.get("one2one_topk", 1))
-    return scale, box_gain, cls_gain, focal_gamma, reg_gain, one2many_topk, one2one_topk, reg_max
+    use_p2 = bool(args.use_p2) if args.use_p2 is not None else bool(saved_args.get("use_p2", False))
+    return scale, box_gain, cls_gain, focal_gamma, reg_gain, one2many_topk, one2one_topk, reg_max, use_p2
 
 
 def _load_positive_class_weights(
@@ -172,12 +179,28 @@ def main() -> None:
                 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.serialization")
                 checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
-    scale, box_gain, cls_gain, focal_gamma, reg_gain, one2many_topk, one2one_topk, reg_max = _resolve_evaluation_settings(checkpoint, args)
+    (
+        scale,
+        box_gain,
+        cls_gain,
+        focal_gamma,
+        reg_gain,
+        one2many_topk,
+        one2one_topk,
+        reg_max,
+        use_p2,
+    ) = _resolve_evaluation_settings(checkpoint, args)
     if reg_max <= 0:
         raise ValueError("Resolved reg_max must be positive")
     class_positive_weights = _load_positive_class_weights(checkpoint, num_classes, device)
 
-    model = build_yolo26(nc=num_classes, scale=scale, topk=args.max_det, reg_max=reg_max).to(device)
+    model = build_yolo26(
+        nc=num_classes,
+        scale=scale,
+        topk=args.max_det,
+        reg_max=reg_max,
+        use_p2=use_p2,
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     dataset = YoloDetectionDataset(split_root, imgsz=args.imgsz, fraction=args.fraction)
@@ -192,7 +215,7 @@ def main() -> None:
 
     criterion = E2EDetectLoss(
         nc=num_classes,
-        strides=STRIDES,
+        strides=tuple(int(stride) for stride in model.detect.stride.detach().cpu().tolist()),
         device=device,
         box_gain=box_gain,
         cls_gain=cls_gain,
@@ -208,7 +231,8 @@ def main() -> None:
     )
     print(
         f"Evaluation settings: scale={scale} box_gain={box_gain:g} cls_gain={cls_gain:g} focal_gamma={focal_gamma:g} "
-        f"reg_gain={reg_gain:g} reg_max={reg_max} one2many_topk={one2many_topk} one2one_topk={one2one_topk} "
+        f"reg_gain={reg_gain:g} reg_max={reg_max} use_p2={use_p2} "
+        f"one2many_topk={one2many_topk} one2one_topk={one2one_topk} "
         f"positive_class_weights=({class_weight_summary}) postprocess={args.postprocess} "
         f"inference_branch={args.inference_branch} "
         f"nms_iou={args.nms_iou:g} nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det}"
@@ -298,6 +322,8 @@ def main() -> None:
                 "focal_gamma": focal_gamma,
                 "reg_gain": reg_gain,
                 "reg_max": reg_max,
+                "use_p2": use_p2,
+                "feature_strides": [int(stride) for stride in model.detect.stride.detach().cpu().tolist()],
                 "one2many_topk": one2many_topk,
                 "one2one_topk": one2one_topk,
                 "positive_class_weights": class_positive_weights.detach().cpu().tolist(),

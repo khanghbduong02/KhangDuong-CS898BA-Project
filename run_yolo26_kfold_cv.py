@@ -13,6 +13,7 @@ from typing import Any
 import torch
 
 from cv_utils import PROJECT_ROOT, discover_folds, project_path, render_fold_path, validate_cv_layout
+from training_control import add_plateau_early_stopping_arguments, plateau_early_stopping_config_from_args
 from yolo_dataset_config import YoloDatasetConfig
 
 
@@ -34,12 +35,19 @@ def training_settings(args: argparse.Namespace, num_classes: int) -> dict[str, A
         "cls_gain": args.cls_gain,
         "reg_gain": args.reg_gain,
         "reg_max": args.reg_max,
+        "use_p2": args.use_p2,
         "one2many_topk": args.one2many_topk,
         "one2one_topk": args.one2one_topk,
         "focal_gamma": args.focal_gamma,
         "class_positive_weight_power": args.class_positive_weight_power,
         "balanced_sampling": args.balanced_sampling,
         "balanced_sampling_power": args.balanced_sampling_power,
+        "reduce_lr_patience": args.reduce_lr_patience,
+        "reduce_lr_factor": args.reduce_lr_factor,
+        "reduce_lr_cooldown": args.reduce_lr_cooldown,
+        "min_lr": args.min_lr,
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
     }
 
 
@@ -94,9 +102,23 @@ def build_train_command(
         str(args.class_positive_weight_power),
         "--balanced-sampling-power",
         str(args.balanced_sampling_power),
+        "--reduce-lr-patience",
+        str(args.reduce_lr_patience),
+        "--reduce-lr-factor",
+        str(args.reduce_lr_factor),
+        "--reduce-lr-cooldown",
+        str(args.reduce_lr_cooldown),
+        "--min-lr",
+        str(args.min_lr),
+        "--early-stopping-patience",
+        str(args.early_stopping_patience),
+        "--early-stopping-min-delta",
+        str(args.early_stopping_min_delta),
         "--save-dir",
         str(run_dir),
     ]
+    if args.use_p2:
+        command.append("--use-p2")
     if args.balanced_sampling:
         command.append("--balanced-sampling")
     return command
@@ -124,16 +146,16 @@ def completed_run_matches(
     fold_root: Path,
     expected_settings: dict[str, Any],
     expected_names: tuple[str, ...],
-) -> tuple[bool, int, list[str]]:
+) -> tuple[bool, int, bool, list[str]]:
     """Return whether a completed checkpoint matches the requested fold protocol."""
     checkpoint = read_checkpoint(last_path)
     epoch = checkpoint.get("epoch")
     if not isinstance(epoch, int):
-        return False, -1, ["checkpoint has no integer epoch"]
+        return False, -1, False, ["checkpoint has no integer epoch"]
 
     saved_args = checkpoint.get("args")
     if not isinstance(saved_args, dict):
-        return False, epoch, ["checkpoint has no saved trainer arguments"]
+        return False, epoch, False, ["checkpoint has no saved trainer arguments"]
 
     mismatches: list[str] = []
     for key, expected in expected_settings.items():
@@ -143,6 +165,9 @@ def completed_run_matches(
         # `reg_max=1` configuration.
         if key == "reg_max" and actual is None:
             actual = 1
+        # Pre-P2 checkpoints use the historical three-level P3--P5 head.
+        if key == "use_p2" and actual is None:
+            actual = False
         if not values_match(expected, actual):
             mismatches.append(f"{key}: expected {expected!r}, found {actual!r}")
 
@@ -157,7 +182,16 @@ def completed_run_matches(
     if saved_names is not None and tuple(str(name) for name in saved_names) != expected_names:
         mismatches.append(f"class_names: expected {list(expected_names)!r}, found {saved_names!r}")
 
-    return not mismatches, epoch, mismatches
+    saved_completion = checkpoint.get("training_completed")
+    if saved_completion is None:
+        completed = epoch >= int(expected_settings["epochs"])
+    elif isinstance(saved_completion, bool):
+        completed = saved_completion
+    else:
+        completed = False
+        mismatches.append(f"training_completed: expected a bool, found {saved_completion!r}")
+
+    return not mismatches, epoch, completed, mismatches
 
 
 def write_plan(
@@ -181,6 +215,7 @@ def write_plan(
         "notes": [
             "Folds are trained sequentially to avoid sharing a single GPU across concurrent jobs.",
             "A completed fold is skipped only when its checkpoint settings match this requested protocol.",
+            "A formula-valid early-stopped fold is complete when last.pt records training_completed=true.",
             "The trainer has no resume mode; partial folds must be retrained with --force or a new run root.",
         ],
     }
@@ -225,12 +260,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cls-gain", type=float, default=0.5)
     parser.add_argument("--reg-gain", type=float, default=1.5)
     parser.add_argument("--reg-max", type=int, default=1, help="Box distance bins per side; values above 1 enable DFL")
+    parser.add_argument("--use-p2", action="store_true", help="Add the optional stride-4 P2 detection level")
     parser.add_argument("--one2many-topk", type=int, default=10)
     parser.add_argument("--one2one-topk", type=int, default=1)
     parser.add_argument("--focal-gamma", type=float, default=0.0)
     parser.add_argument("--class-positive-weight-power", type=float, default=0.0)
     parser.add_argument("--balanced-sampling", action="store_true")
     parser.add_argument("--balanced-sampling-power", type=float, default=1.0)
+    add_plateau_early_stopping_arguments(parser)
     parser.add_argument(
         "--force",
         action="store_true",
@@ -251,6 +288,7 @@ def main() -> None:
         raise ValueError("--reg-max must be positive")
     if args.workers < 0 or not 0.0 < args.fraction <= 1.0:
         raise ValueError("--workers must be non-negative and --fraction must be in (0, 1]")
+    plateau_early_stopping_config_from_args(args)
     if not args.data_root.is_dir():
         raise FileNotFoundError(f"Data root does not exist: {args.data_root}")
 
@@ -271,16 +309,20 @@ def main() -> None:
                     f"fold={fold}: {run_dir} exists without both best.pt and last.pt. "
                     "Use --force to restart it or choose a new --run-root."
                 )
-            matches, completed_epoch, mismatches = completed_run_matches(
+            matches, completed_epoch, completed, mismatches = completed_run_matches(
                 last_path,
                 fold_root,
                 settings,
                 dataset_config.class_names,
             )
-            if completed_epoch >= args.epochs and matches:
+            if completed and matches:
                 print(f"fold={fold}: skipping matching completed run at epoch={completed_epoch}: {run_dir}")
                 continue
-            mismatch_text = "; ".join(mismatches) if mismatches else f"only reached epoch {completed_epoch}"
+            mismatch_text = (
+                "; ".join(mismatches)
+                if mismatches
+                else f"training did not complete; last checkpoint is epoch {completed_epoch}"
+            )
             raise RuntimeError(
                 f"fold={fold}: existing run cannot be reused: {mismatch_text}. "
                 "Use --force to retrain or choose a distinct --run-root."
@@ -299,16 +341,16 @@ def main() -> None:
         subprocess.run(command, cwd=PROJECT_ROOT, check=True)
         if not last_path.exists() or not (run_dir / "best.pt").exists():
             raise RuntimeError(f"fold={fold}: training ended without both best.pt and last.pt in {run_dir}")
-        matches, completed_epoch, mismatches = completed_run_matches(
+        matches, completed_epoch, completed, mismatches = completed_run_matches(
             last_path,
             fold_root,
             settings,
             dataset_config.class_names,
         )
-        if not matches or completed_epoch != args.epochs:
+        if not matches or not completed:
             raise RuntimeError(
                 f"fold={fold}: saved result does not match the requested protocol: "
-                f"epoch={completed_epoch}, mismatches={mismatches}"
+                f"epoch={completed_epoch}, completed={completed}, mismatches={mismatches}"
             )
         print(f"fold={fold}: completed epoch={completed_epoch}; checkpoints saved in {run_dir}")
 

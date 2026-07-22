@@ -59,7 +59,7 @@ The detector expects bounding boxes. During preprocessing, five-field source row
 ### Object Detection Models
 
 * YOLO26-style one-stage detector: implemented as the primary model.
-* Faster R-CNN: implemented as a fully local two-stage scratch reference and evaluated on the same grouped five-class folds after an RPN-supervision repair.
+* Faster R-CNN: implemented as a fully local two-stage detector; its random-initialization configuration is the scratch reference, and a separately reported ImageNet-backbone transfer study is complete.
 
 ## Implemented YOLO26-style Pipeline
 
@@ -67,7 +67,7 @@ This repository includes a local PyTorch YOLO26-style architecture based on the 
 
 ### Components
 
-* `models/yolo26_torch.py` defines the backbone, PAN/FPN neck, C3k2, SPPF, C2PSA attention, dual one-to-many/one-to-one detection branches, class-aware NMS, and configurable direct/DFL-style box decoding.
+* `models/yolo26_torch.py` defines the backbone, PAN/FPN neck, C3k2, SPPF, C2PSA attention, dual one-to-many/one-to-one detection branches, class-aware NMS, configurable direct/DFL-style box decoding, and an optional stride-4 P2 small-object head.
 * `test.py` runs a forward-pass smoke test and prints output tensor shapes.
 * `train_yolo26.py` trains the model from scratch using Task-Aligned Assignment, focal/BCE classification loss, direct or distributional (DFL) box regression, AdamW, AMP, and gradient clipping.
 * `eval_yolo26.py` evaluates a saved checkpoint on validation or test data and can explicitly decode the one-to-many or historical one-to-one branch.
@@ -89,7 +89,7 @@ Expected output shape pattern:
 
 ## Implemented Faster R-CNN Pipeline
 
-The alternative detector is also implemented locally and has no pretrained backbone or high-level torchvision detector dependency. It uses a ResNet-style backbone, P3--P6 FPN, RPN, multi-level RoI Align, class-agnostic box regression, and per-class NMS. Dataset labels remain zero-indexed YOLO IDs outside the model; Faster R-CNN shifts foreground labels internally because it reserves index `0` for background.
+The alternative detector is implemented locally without a high-level torchvision detector dependency. Its scratch baseline uses a randomly initialized ResNet-style backbone, P3--P6 FPN, RPN, multi-level RoI Align, class-agnostic box regression, and per-class NMS. Dataset labels remain zero-indexed YOLO IDs outside the model; Faster R-CNN shifts foreground labels internally because it reserves index `0` for background.
 
 * `models/faster_rcnn.py` implements the detector, canonical FPN proposal-level assignment, multi-positive RPN supervision for from-scratch learning, configurable candidate/NMS settings, and validation-loss computation without updating BatchNorm statistics.
 * `train_faster_rcnn.py` is the reproducible one-fold training primitive with strict label validation, `data.yaml` metadata validation, optional foreground class weighting/sampling, AMP, gradient clipping, checkpoint metadata, and JSONL history.
@@ -97,9 +97,11 @@ The alternative detector is also implemented locally and has no pretrained backb
 * `run_faster_rcnn_kfold_cv.py` and `eval_faster_rcnn_kfold_cv.py` provide generic sequential grouped-CV training and aggregate evaluation for the standard `fold_<n>` layout.
 * `test_faster_rcnn.py` checks canonical FPN-level assignment, RPN multi-positive target assignment, finite loss/backpropagation, validation BatchNorm isolation, and per-class-NMS inference output.
 
-For a separately labeled practical transfer-learning study, Faster R-CNN `s` can initialize its local ResNet-18-compatible backbone from torchvision ImageNet weights using `--backbone-weights imagenet`. Use `--backbone-lr-multiplier 0.1` to fine-tune those imported backbone weights more conservatively than the random FPN/RPN/RoI heads. This changes the study from scratch learning to transfer learning; it must be reported separately and is not an architecture-only comparison with the scratch detectors.
+The separately labeled practical transfer-learning study initialized Faster R-CNN `s`'s local ResNet-18-compatible backbone from torchvision ImageNet weights using `--backbone-weights imagenet` and applied `--backbone-lr-multiplier 0.1` to fine-tune the imported backbone more conservatively than the random FPN/RPN/RoI heads. This changes the study from scratch learning to transfer learning; it is reported separately and is not an architecture-only comparison with the scratch detectors.
 
-The implementation passed a same-images, three-class overfit diagnostic after an RPN-supervision repair: mAP50 `0.9881`, mAP50-95 `0.8109`, and recall `0.9869`. This validates the local learning path only; it is not a generalization result. A replacement 960-pixel three-fold grouped-CV baseline then reached mAP50 $0.0935 \pm 0.0522$, mAP50-95 $0.0284 \pm 0.0203$, precision $0.1441 \pm 0.0157$, and recall $0.1445 \pm 0.0369$. It has lower and less stable aggregate mAP than direct YOLO26 + NMS, but higher recall. The two scratch systems differ substantially in parameter count, and neither is an architecture-only comparison to pretrained YOLO11n.
+The implementation passed a same-images, three-class overfit diagnostic after an RPN-supervision repair: mAP50 `0.9881`, mAP50-95 `0.8109`, and recall `0.9869`. This validates the local learning path only; it is not a generalization result. A replacement 960-pixel three-fold grouped-CV baseline then reached mAP50 $0.0935 \pm 0.0522$, mAP50-95 $0.0284 \pm 0.0203$, precision $0.1441 \pm 0.0157$, and recall $0.1445 \pm 0.0369$. It has lower and less stable aggregate mAP than direct YOLO26 + NMS, but higher recall. The completed ImageNet treatment selected epochs `3` / `1` / `2` and reached mAP50 $0.0665 \pm 0.0391$, mAP50-95 $0.0187 \pm 0.0114$, precision $0.1087 \pm 0.0189$, and recall $0.2546 \pm 0.0650$. It therefore lost $0.0270$ mAP50, $0.0097$ mAP50-95, and $0.0354$ precision versus the same Faster R-CNN scratch baseline, despite gaining $0.1101$ recall. The transfer treatment is rejected as an aggregate-AP improvement; no second transfer variation is planned. The two scratch systems differ substantially in parameter count, and neither is an architecture-only comparison to pretrained YOLO11n.
+
+Both custom trainers now share validation-loss `ReduceLROnPlateau` and early stopping. The default policy is reduction patience `8`, factor `0.5`, cooldown `2`, minimum LR `1e-6`, and early-stopping patience `18`, satisfying $18 = 2(8) + 2$. A real LR reduction resets the early-stopping counter so the reduced rate can improve before a run stops. Set both patience arguments to `0` and cooldown to `0` only for explicit archival reproduction. Checkpoints record the controller state, current learning rates, completion state, and stop reason; K-fold runners accept a matching early-stopped fold as complete. Both architectures also offer `--use-p2`: YOLO26 adds a stride-4 PAN detection head, while Faster R-CNN expands from P3--P6 to P2--P6 with 16-pixel base anchors and stride-aware RoI assignment. The flag changes checkpoint shapes and is disabled by default for historical compatibility.
 
 ### Image Processing Techniques
 
@@ -139,6 +141,10 @@ That 960-pixel custom ablation is now complete. It improved aggregate custom per
 
 The fixed class-aware NMS diagnostic first improved the historical one-to-one 960 result to mAP50 $0.1127 \pm 0.0232$ and mAP50-95 $0.0343 \pm 0.0076$. A later no-retraining three-fold branch diagnostic established that decoding the full-gradient one-to-many branch with the same NMS settings is stronger: mAP50 $0.1270 \pm 0.0210$, mAP50-95 $0.0420 \pm 0.0081$, precision $0.1153 \pm 0.0207$, and recall $0.1159 \pm 0.0246$. This is the selected custom evaluation/inference configuration. Use `--inference-branch one2one` or `--postprocess legacy_topk` only to reproduce historical reports. No further export-level sweeps are planned.
 
+The completed Faster R-CNN ImageNet-transfer treatment remains below the selected one-to-many YOLO26 configuration in ranked detection: mAP50 $0.0665$ versus $0.1270$ and mAP50-95 $0.0187$ versus $0.0420$, although its fixed-threshold recall is higher ($0.2546$ versus $0.1159$). The five-class pretrained YOLO11n practical reference remains substantially stronger at mAP50 $0.4799 \pm 0.0262$, mAP50-95 $0.1979 \pm 0.0076$, precision $0.3766 \pm 0.0133$, and recall $0.2459 \pm 0.0137$. That reference differs in much more than backbone pretraining—COCO pretraining, detector/loss implementation, augmentation, preprocessing, optimizer, and NMS—so it is a practical-system reference rather than a causal architecture-only comparison.
+
+The next user-authorized same-dataset study is prepared but has not yet been run: both local models will use the existing five-class grouped folds unchanged, the optional P2 path, and the shared plateau/early-stopping policy. It must use distinct run roots, validation folds only for selection, and the existing project metrics/NMS. The public candidate test split remains excluded. This is a combined training-system/architecture improvement attempt; it cannot guarantee equality with YOLO11 because YOLO11 retains COCO pretraining and a different training/augmentation stack.
+
 A fixed three-fold DFL (`reg_max=16`) box-regression experiment was then evaluated with the same 960 input, focal/weight settings, NMS, batch size, seed, and epoch budget under the historical one-to-one inference protocol. It was rejected: mAP50 was $0.0802 \pm 0.0258$ and mAP50–95 was $0.0258 \pm 0.0093$, both below historical direct regression plus NMS. The DFL implementation and compatibility tests remain in the codebase as a documented negative architecture result; the selected custom head remains direct regression (`reg_max=1`).
 
 ### Reusable K-fold cross-validation
@@ -176,6 +182,8 @@ python prepare_voc2007.py --raw-root candidate-data/pascal-voc-2007 --output-roo
 
 This is a project-metric external benchmark, **not** an official VOC leaderboard protocol: the project metric implementation does not support VOC difficult-object ignores. The frozen scratch comparison uses the capacity-matched pair YOLO26 `l` (27.08M parameters) and Faster R-CNN `s` (28.87M parameters), at 640 pixels, batch size 8, seed 42, 100 epochs, AdamW (`lr=1e-4`, `weight_decay=5e-4`), direct YOLO regression, no focal loss, no class weights/sampler/augmentation, and project NMS defaults. Train using official `train`, select with official `valid`, and evaluate official `test` only once after both models are frozen.
 
+The archived VOC commands below predate the plateau/early-stopping controller. For exact historical reproduction only, append `--reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0`; the VOC protocol is closed, so do not run them again.
+
 The conversion and 640-pixel batch-8 CUDA resource smokes are complete. The frozen scratch YOLO26 `l` run selected epoch 14 by validation loss and reached validation mAP50 $0.1450$, mAP50–95 $0.0567$, precision $0.6276$, and recall $0.0772$ at confidence $0.25$. Under the same frozen protocol, scratch Faster R-CNN `s` reached validation mAP50 $0.0723$, mAP50–95 $0.0278$, precision $0.1974$, and recall $0.1327$. On the single frozen official test evaluation, YOLO26 reached mAP50 $0.1318$, mAP50–95 $0.0527$, precision $0.5958$, and recall $0.0824$; Faster R-CNN reached mAP50 $0.0726$, mAP50–95 $0.0292$, precision $0.2094$, and recall $0.1514$. YOLO26 has stronger AP and precision, while Faster R-CNN has higher fixed-threshold recall. These are project-metric from-scratch results, not official VOC scores: difficult objects were excluded and no further VOC tuning or test evaluation is permitted.
 
 VOC 2007 uses official train/validation/test folders rather than `fold_<n>` directories, so use the **one-fold primitives**, not the K-fold runners. Run the models sequentially rather than concurrently on one GPU.
@@ -191,7 +199,7 @@ python train_faster_rcnn.py --data-root processed-candidate-data/pascal-voc-2007
 Evaluate each frozen checkpoint on official validation data:
 
 ```bash
-python eval_yolo26.py --checkpoint runs/yolo26/voc2007_official_imgsz640_yolo26l_scratch_seed42_e100/best.pt --data-root processed-candidate-data/pascal-voc-2007/official --split valid --batch-size 8 --imgsz 640 --workers 0 --fraction 1.0 --device cuda --conf-thresh 0.25 --postprocess class_aware_nms --nms-iou 0.70 --nms-score-thresh 0.001 --max-det 300 --metrics-output runs/yolo26/voc2007_official_imgsz640_yolo26l_scratch_seed42_e100/valid_metrics.json
+python eval_yolo26.py --checkpoint runs/yolo26/voc2007_official_imgsz640_yolo26l_scratch_seed42_e100/best.pt --data-root processed-candidate-data/pascal-voc-2007/official --split valid --batch-size 8 --imgsz 640 --workers 0 --fraction 1.0 --device cuda --conf-thresh 0.25 --postprocess class_aware_nms --inference-branch one2one --nms-iou 0.70 --nms-score-thresh 0.001 --max-det 300 --metrics-output runs/yolo26/voc2007_official_imgsz640_yolo26l_scratch_seed42_e100/valid_metrics.json
 
 python eval_faster_rcnn.py --checkpoint runs/faster_rcnn/voc2007_official_imgsz640_frcnns_scratch_seed42_e100/best.pt --data-root processed-candidate-data/pascal-voc-2007/official --split valid --batch-size 8 --imgsz 640 --workers 0 --fraction 1.0 --device cuda --conf-thresh 0.25 --nms-iou 0.70 --nms-score-thresh 0.001 --max-det 300 --metrics-output runs/faster_rcnn/voc2007_official_imgsz640_frcnns_scratch_seed42_e100/valid_metrics.json
 ```

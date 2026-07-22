@@ -9,7 +9,7 @@ background and shifts foreground IDs by one.
 Architecture
 ------------
 Backbone : ResNet-style CNN with BasicBlocks   (scale: s / m / l)
-Neck     : Feature Pyramid Network (FPN)       — 4 levels P3–P6
+Neck     : Feature Pyramid Network (FPN)       — P3–P6 by default, optional P2–P6
 RPN      : Region Proposal Network             — 3 anchors / location / level
 RoI      : RoI Align 7×7 (torchvision.ops)
 Head     : 2× FC → cls (nc+1) + class-agnostic box regression
@@ -39,6 +39,8 @@ SCALE_CONFIG: Dict[str, Tuple[List[int], List[int]]] = {
 FPN_CHANNELS   = 256
 ANCHOR_STRIDES = [8,   16,   32,   64]   # feature stride per FPN level P3–P6
 ANCHOR_SIZES   = [32,  64,  128,  256]   # base anchor size per level
+P2_ANCHOR_STRIDES = [4, 8, 16, 32, 64]   # optional P2–P6 feature strides
+P2_ANCHOR_SIZES   = [16, 32, 64, 128, 256]
 ANCHOR_RATIOS  = [0.5, 1.0, 2.0]        # anchor height/width aspect ratios
 NUM_ANCHORS    = len(ANCHOR_RATIOS)      # anchors per spatial location per level
 
@@ -106,7 +108,7 @@ def _make_stage(in_ch: int, out_ch: int, n_blocks: int, stride: int = 1) -> nn.S
 
 
 class ResNetBackbone(nn.Module):
-    """4-stage ResNet-style backbone; returns (C3, C4, C5) at strides 8, 16, 32."""
+    """4-stage ResNet-style backbone returning C2--C5 at strides 4--32."""
 
     def __init__(self, channels: List[int], blocks: List[int]) -> None:
         super().__init__()
@@ -125,6 +127,7 @@ class ResNetBackbone(nn.Module):
         self.stage4 = _make_stage(c3, c4, blocks[3], stride=2)   # stride 32 (C5)
 
         self.out_channels = [c2, c3, c4]   # channels of C3, C4, C5
+        self.out_channels_with_p2 = [c1, c2, c3, c4]  # channels of C2, C3, C4, C5
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -135,13 +138,13 @@ class ResNetBackbone(nn.Module):
 
     def forward(
         self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         x  = self.stem(x)
-        x  = self.stage1(x)
-        c3 = self.stage2(x)    # stride 8
+        c2 = self.stage1(x)    # stride 4
+        c3 = self.stage2(c2)   # stride 8
         c4 = self.stage3(c3)   # stride 16
         c5 = self.stage4(c4)   # stride 32
-        return c3, c4, c5
+        return c2, c3, c4, c5
 
     @staticmethod
     def _map_torchvision_resnet_key(source_key: str) -> str | None:
@@ -228,10 +231,16 @@ class ResNetBackbone(nn.Module):
 # ===========================================================================
 
 class FPN(nn.Module):
-    """Top-down FPN producing P3, P4, P5, P6 with equal channel width."""
+    """Top-down FPN producing P3--P6 or optional P2--P6 feature maps."""
 
-    def __init__(self, in_channels: List[int], out_ch: int = FPN_CHANNELS) -> None:
+    def __init__(self, in_channels: List[int], out_ch: int = FPN_CHANNELS, use_p2: bool = False) -> None:
         super().__init__()
+        expected_inputs = 4 if use_p2 else 3
+        if len(in_channels) != expected_inputs:
+            raise ValueError(
+                f"FPN use_p2={use_p2} requires {expected_inputs} input levels, got {len(in_channels)}"
+            )
+        self.use_p2 = use_p2
         self.lateral = nn.ModuleList([nn.Conv2d(c, out_ch, 1) for c in in_channels])
         self.smooth  = nn.ModuleList([nn.Conv2d(out_ch, out_ch, 3, 1, 1) for _ in in_channels])
         self.p6_conv = nn.Conv2d(in_channels[-1], out_ch, 3, 2, 1)   # P6 from C5
@@ -243,19 +252,26 @@ class FPN(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(
-        self, c3: torch.Tensor, c4: torch.Tensor, c5: torch.Tensor
+        self, c2: torch.Tensor, c3: torch.Tensor, c4: torch.Tensor, c5: torch.Tensor
     ) -> List[torch.Tensor]:
-        l3, l4, l5 = self.lateral[0](c3), self.lateral[1](c4), self.lateral[2](c5)
-        # Top-down merge
-        t5 = l5
-        t4 = l4 + F.interpolate(t5, size=l4.shape[-2:], mode="nearest")
-        t3 = l3 + F.interpolate(t4, size=l3.shape[-2:], mode="nearest")
-        return [
-            self.smooth[0](t3),   # P3  stride 8
-            self.smooth[1](t4),   # P4  stride 16
-            self.smooth[2](t5),   # P5  stride 32
-            self.p6_conv(c5),     # P6  stride 64
+        backbone_features = [c2, c3, c4, c5] if self.use_p2 else [c3, c4, c5]
+        laterals = [layer(feature) for layer, feature in zip(self.lateral, backbone_features)]
+        top_down: list[torch.Tensor | None] = [None] * len(laterals)
+        top_down[-1] = laterals[-1]
+        for index in range(len(laterals) - 2, -1, -1):
+            assert top_down[index + 1] is not None
+            top_down[index] = laterals[index] + F.interpolate(
+                top_down[index + 1],
+                size=laterals[index].shape[-2:],
+                mode="nearest",
+            )
+        outputs = [
+            self.smooth[index](feature)
+            for index, feature in enumerate(top_down)
+            if feature is not None
         ]
+        outputs.append(self.p6_conv(c5))
+        return outputs
 
 
 # ===========================================================================
@@ -566,12 +582,16 @@ class RPN(nn.Module):
 # RoI Align helper
 # ===========================================================================
 
-def _assign_levels(boxes: torch.Tensor, num_levels: int = 4) -> torch.Tensor:
-    """Map boxes to P3--P6 using the canonical FPN scale-to-level formula."""
+def _assign_levels(boxes: torch.Tensor, num_levels: int = 4, min_level: int = 3) -> torch.Tensor:
+    """Map boxes to contiguous FPN levels using the canonical scale formula."""
+    if num_levels <= 0:
+        raise ValueError("num_levels must be positive")
+    if min_level < 0:
+        raise ValueError("min_level must be non-negative")
     areas  = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
     scales = areas.clamp(min=1e-6).sqrt()
     canonical_levels = torch.floor(4.0 + torch.log2(scales / 224.0 + 1e-6)).long()
-    return (canonical_levels - 3).clamp(0, num_levels - 1)
+    return (canonical_levels - min_level).clamp(0, num_levels - 1)
 
 
 def roi_align_multilevel(
@@ -581,6 +601,10 @@ def roi_align_multilevel(
     output_size:       int        = ROI_OUTPUT_SIZE,
 ) -> torch.Tensor:
     """Pool features from the matching FPN level for every proposal."""
+    if len(features) != len(strides):
+        raise ValueError(f"Expected one stride per feature map, got {len(features)} features and {len(strides)} strides")
+    if not strides or any(stride <= 0 for stride in strides):
+        raise ValueError("Feature strides must be positive")
     device = features[0].device
     C = features[0].shape[1]
 
@@ -596,7 +620,8 @@ def roi_align_multilevel(
 
     rois   = torch.cat(rois_list, dim=0)      # (N_total, 5)
     boxes  = rois[:, 1:]
-    levels = _assign_levels(boxes, num_levels=len(features))
+    min_level = int(round(math.log2(strides[0])))
+    levels = _assign_levels(boxes, num_levels=len(features), min_level=min_level)
 
     out = features[0].new_zeros(rois.shape[0], C, output_size, output_size)
     for lvl, (feat, stride) in enumerate(zip(features, strides)):
@@ -658,6 +683,9 @@ class FasterRCNN(nn.Module):
         nms_threshold: float = DEFAULT_NMS_THRESH,
         max_detections: int = DEFAULT_DETECTIONS_MAX,
         backbone_initialization: str = "random",
+        feature_strides: Optional[List[int]] = None,
+        anchor_sizes: Optional[List[int]] = None,
+        use_p2: bool = False,
     ) -> None:
         super().__init__()
         if num_classes < 2:
@@ -670,6 +698,13 @@ class FasterRCNN(nn.Module):
         self.min_size    = min_size
         self.max_size    = max_size
         self.backbone_initialization = backbone_initialization
+        self.feature_strides = list(ANCHOR_STRIDES if feature_strides is None else feature_strides)
+        self.anchor_sizes = list(ANCHOR_SIZES if anchor_sizes is None else anchor_sizes)
+        self.use_p2 = bool(use_p2)
+        if len(self.feature_strides) != len(self.anchor_sizes):
+            raise ValueError("Faster R-CNN feature strides and anchor sizes must have the same length")
+        if any(stride <= 0 for stride in self.feature_strides) or any(size <= 0 for size in self.anchor_sizes):
+            raise ValueError("Faster R-CNN feature strides and anchor sizes must be positive")
 
         self.register_buffer(
             "pixel_mean", torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -706,13 +741,15 @@ class FasterRCNN(nn.Module):
         self.nms_threshold = float(nms_threshold)
         self.max_detections = int(max_detections)
 
-    def inference_settings(self) -> Dict[str, float | int | str]:
+    def inference_settings(self) -> Dict[str, object]:
         """Return serializable inference metadata for checkpoints and reports."""
         return {
             "postprocess": "per_class_nms",
             "score_threshold": self.score_threshold,
             "nms_threshold": self.nms_threshold,
             "max_detections": self.max_detections,
+            "use_p2": self.use_p2,
+            "feature_strides": list(self.feature_strides),
         }
 
     def _normalise(
@@ -799,7 +836,7 @@ class FasterRCNN(nn.Module):
             zero = features[0].sum() * 0.0
             return {"loss_classifier": zero, "loss_box_reg": zero}
 
-        pooled     = roi_align_multilevel(features, sampled_props)
+        pooled     = roi_align_multilevel(features, sampled_props, strides=self.feature_strides)
         cls_logits, box_preds = self.head(pooled)
 
         all_labels = torch.cat(sampled_labels)
@@ -838,7 +875,7 @@ class FasterRCNN(nn.Module):
         if all(p.numel() == 0 for p in proposals):
             return [dict(empty) for _ in proposals]
 
-        pooled = roi_align_multilevel(features, proposals)
+        pooled = roi_align_multilevel(features, proposals, strides=self.feature_strides)
         cls_logits, box_preds = self.head(pooled)
         cls_probs = F.softmax(cls_logits, dim=1)
 
@@ -906,9 +943,13 @@ class FasterRCNN(nn.Module):
         if compute_losses and targets is None:
             raise ValueError("Loss computation requires targets")
         batch, img_h, img_w = self._normalise(images)
-        c3, c4, c5          = self.backbone(batch)
-        features            = self.fpn(c3, c4, c5)
-        anchors             = generate_anchors(features)
+        c2, c3, c4, c5      = self.backbone(batch)
+        features            = self.fpn(c2, c3, c4, c5)
+        anchors             = generate_anchors(
+            features,
+            strides=self.feature_strides,
+            sizes=self.anchor_sizes,
+        )
 
         proposals, rpn_losses = self.rpn(
             features, anchors, img_h, img_w,
@@ -937,6 +978,7 @@ def build_faster_rcnn(
     nms_threshold: float = DEFAULT_NMS_THRESH,
     max_detections: int = DEFAULT_DETECTIONS_MAX,
     backbone_weights: str = "none",
+    use_p2: bool = False,
 ) -> FasterRCNN:
     """Build a fully custom Faster R-CNN.
 
@@ -952,6 +994,8 @@ def build_faster_rcnn(
         max_detections: Maximum detections retained per image after NMS.
         backbone_weights: ``none`` for random initialization, or ``imagenet``
             for a torchvision ImageNet-initialized compatible backbone.
+        use_p2: Include a stride-4 P2 feature level and 16-pixel base anchors
+            for small-object detection. Defaults to the historical P3--P6 layout.
 
     Returns:
         A :class:`FasterRCNN` with randomly initialised weights, no external
@@ -986,7 +1030,10 @@ def build_faster_rcnn(
     backbone_initialization = "random"
     if backbone_weights == "imagenet":
         backbone_initialization = backbone.load_imagenet_weights(scale)
-    fpn      = FPN(backbone.out_channels, FPN_CHANNELS)
+    feature_strides = P2_ANCHOR_STRIDES if use_p2 else ANCHOR_STRIDES
+    anchor_sizes = P2_ANCHOR_SIZES if use_p2 else ANCHOR_SIZES
+    fpn_input_channels = backbone.out_channels_with_p2 if use_p2 else backbone.out_channels
+    fpn      = FPN(fpn_input_channels, FPN_CHANNELS, use_p2=use_p2)
     rpn      = RPN(FPN_CHANNELS)
     head     = DetectionHead(FPN_CHANNELS, ROI_OUTPUT_SIZE, nc + 1)
 
@@ -1003,4 +1050,7 @@ def build_faster_rcnn(
         nms_threshold=nms_threshold,
         max_detections=max_detections,
         backbone_initialization=backbone_initialization,
+        feature_strides=feature_strides,
+        anchor_sizes=anchor_sizes,
+        use_p2=use_p2,
     )

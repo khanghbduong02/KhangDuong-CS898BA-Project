@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from models.yolo26_torch import DistributionIntegral, build_yolo26, class_aware_nms
+from train_yolo26 import E2EDetectLoss, compute_loss
 
 
 def test_class_aware_nms() -> None:
@@ -70,6 +71,39 @@ def main() -> None:
 	assert torch.isfinite(dfl_outputs["decoded"]).all()
 	assert dfl_model.detect.decode_branch(dfl_outputs["one2many"]).shape == (1, 9, 8400)
 	print("distributional_head:", tuple(dfl_outputs["one_to_many"].shape))
+
+	p2_model = build_yolo26(nc=3, scale="n", topk=300, use_p2=True)
+	p2_model.eval()
+	with torch.no_grad():
+		p2_outputs = p2_model(x)
+	assert tuple(p2_model.detect.stride.tolist()) == (4.0, 8.0, 16.0, 32.0)
+	assert p2_outputs["one_to_many"].shape == (1, 7, 34000)
+	assert p2_outputs["one_to_one"].shape == (1, 300, 6)
+	assert p2_model.detect.decode_branch(p2_outputs["one2many"]).shape == (1, 7, 34000)
+	print("p2_head:", tuple(p2_outputs["one_to_many"].shape))
+
+	p2_model.train()
+	p2_training_outputs = p2_model(x)
+	p2_criterion = E2EDetectLoss(
+		nc=3,
+		strides=(4, 8, 16, 32),
+		device=x.device,
+		box_gain=7.5,
+		cls_gain=0.5,
+		reg_gain=1.5,
+		one2many_topk=10,
+		one2one_topk=1,
+	)
+	p2_loss = compute_loss(
+		p2_training_outputs,
+		[torch.tensor([[1.0, 0.5, 0.5, 0.1, 0.1]])],
+		nc=3,
+		criterion=p2_criterion,
+		device=x.device,
+	)
+	assert torch.isfinite(p2_loss.total)
+	p2_loss.total.backward()
+	print("p2_training_loss: passed")
 
 	test_class_aware_nms()
 	print("class_aware_nms: passed")
