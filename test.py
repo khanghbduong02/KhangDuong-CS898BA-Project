@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
 import torch
 
 from models.yolo26_torch import DistributionIntegral, build_yolo26, class_aware_nms
-from train_yolo26 import E2EDetectLoss, compute_loss
+from train_yolo26 import E2EDetectLoss, build_positive_class_weights, compute_loss
 
 
 def test_class_aware_nms() -> None:
@@ -42,6 +46,20 @@ def test_distribution_integral() -> None:
 	distances = DistributionIntegral(reg_max)(logits)
 	expected = torch.tensor([[[0.0], [1.0], [2.0], [3.0]]])
 	assert torch.allclose(distances, expected, atol=1e-4)
+
+
+def test_neutral_class_weights_allow_missing_smoke_classes() -> None:
+	"""A neutral class-weight setting supports deliberately small smoke subsets."""
+	with tempfile.TemporaryDirectory() as temporary_directory:
+		labels_dir = Path(temporary_directory) / "labels"
+		labels_dir.mkdir()
+		image_path = Path(temporary_directory) / "sample.jpg"
+		(labels_dir / "sample.txt").write_text("0 0.5 0.5 0.1 0.1\n", encoding="utf-8")
+		dataset = SimpleNamespace(image_paths=[image_path], labels_dir=labels_dir)
+		weights, counts = build_positive_class_weights(dataset, num_classes=2, power=0.0)
+
+	assert counts == [1, 0]
+	assert torch.equal(weights, torch.ones(2))
 
 
 def main() -> None:
@@ -109,6 +127,8 @@ def main() -> None:
 	print("class_aware_nms: passed")
 	test_distribution_integral()
 	print("distribution_integral: passed")
+	test_neutral_class_weights_allow_missing_smoke_classes()
+	print("neutral_smoke_class_weights: passed")
 
 
 if __name__ == "__main__":

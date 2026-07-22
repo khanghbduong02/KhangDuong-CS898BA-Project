@@ -179,6 +179,11 @@ def build_positive_class_weights(
         for class_id, count in enumerate(label_counts):
             class_box_counts[class_id] += count
 
+    # Neutral weighting does not require every class to occur in an explicitly
+    # small smoke subset. Nonzero powers still require all classes because an
+    # inverse-frequency weight would be undefined for a missing class.
+    if any(count == 0 for count in class_box_counts) and power == 0.0:
+        return torch.ones(num_classes, dtype=torch.float32), class_box_counts
     if any(count == 0 for count in class_box_counts):
         raise ValueError(f"Cannot build positive class weights because box counts are {class_box_counts}")
 
