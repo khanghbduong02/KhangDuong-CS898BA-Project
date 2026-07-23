@@ -159,6 +159,16 @@ The project separates one-fold model logic from cross-validation orchestration:
 - [run_faster_rcnn_kfold_cv.py](run_faster_rcnn_kfold_cv.py) and [eval_faster_rcnn_kfold_cv.py](eval_faster_rcnn_kfold_cv.py) provide the equivalent fully local Faster R-CNN workflow, including frozen-setting checkpoint checks and overall/per-class metric aggregation.
 - [run_ultralytics_kfold_cv.py](run_ultralytics_kfold_cv.py) and [eval_ultralytics_kfold_cv.py](eval_ultralytics_kfold_cv.py) provide a generic pretrained Ultralytics reference workflow for the same fold layout.
 
+### Batch demonstration
+
+[demo_ultralytics.py](demo_ultralytics.py) creates annotated output images and a JSON prediction summary from a frozen Ultralytics checkpoint. It is intended for the recorded final demonstration, not for cross-validation metric selection. Use a validation-image directory rather than the excluded public candidate test split:
+
+```bash
+python demo_ultralytics.py --checkpoint runs/ultralytics/candidate_cv3_yolo26n_pretrained_imgsz640_seed42_e50/fold_1/weights/best.pt --source cv-data/roboflow-3d-print-fail-v1/fold_1/valid/images --output-dir demo-output/yolo26n_fold1_valid --imgsz 640 --batch-size 8 --conf 0.25 --iou 0.70 --max-det 300 --device 0 --max-images 12
+```
+
+The generated annotated images can be shown in a batch-processing video. The output JSON records the checkpoint, inference settings, and each displayed detection.
+
 Example custom YOLO26 K-fold invocation:
 
 ```bash
