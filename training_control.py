@@ -1,9 +1,10 @@
-"""Shared validation-loss scheduler and early-stopping controls for local trainers.
+"""Shared training-control and checkpoint-selection policies for local trainers.
 
-The controls deliberately use the same validation-loss signal already used to
-select ``best.pt``. A plateau-triggered learning-rate reduction resets the
-consecutive non-improvement counter so the reduced rate receives a fair chance
-to improve validation loss before early stopping ends a run.
+The scheduler and early stopper monitor validation loss. A plateau-triggered
+learning-rate reduction resets the consecutive non-improvement counter so the
+reduced rate receives a fair chance to improve validation loss before early
+stopping ends a run. Checkpoint selection can independently use validation
+loss or validation mAP50.
 """
 from __future__ import annotations
 
@@ -22,6 +23,8 @@ DEFAULT_REDUCE_LR_COOLDOWN = 2
 DEFAULT_MIN_LR = 1e-6
 DEFAULT_EARLY_STOPPING_PATIENCE = 18
 DEFAULT_EARLY_STOPPING_MIN_DELTA = 0.0
+DEFAULT_CHECKPOINT_SELECTION = "val_loss"
+CHECKPOINT_SELECTION_CHOICES = ("val_loss", "map50")
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,50 @@ def add_plateau_early_stopping_arguments(parser: argparse.ArgumentParser) -> Non
         default=DEFAULT_EARLY_STOPPING_MIN_DELTA,
         help="Minimum validation-loss decrease required to reset early-stopping patience",
     )
+
+
+def add_checkpoint_selection_argument(parser: argparse.ArgumentParser) -> None:
+    """Add a reproducible criterion for choosing ``best.pt``.
+
+    The selection criterion is intentionally independent of the loss-based
+    scheduler and early stopper. This lets a detection project choose the
+    checkpoint aligned with its reported AP metric without changing the
+    requested patience policy.
+    """
+    parser.add_argument(
+        "--checkpoint-selection",
+        choices=CHECKPOINT_SELECTION_CHOICES,
+        default=DEFAULT_CHECKPOINT_SELECTION,
+        help=(
+            "Metric used to save best.pt: val_loss preserves historical behavior; "
+            "map50 selects highest validation mAP50 while LR scheduling and early stopping remain loss-based"
+        ),
+    )
+
+
+def validate_checkpoint_selection(selection: str) -> str:
+    """Validate and normalize a checkpoint-selection policy."""
+    if selection not in CHECKPOINT_SELECTION_CHOICES:
+        raise ValueError(
+            f"checkpoint selection must be one of {CHECKPOINT_SELECTION_CHOICES}, got {selection!r}"
+        )
+    return selection
+
+
+def initial_checkpoint_selection_value(selection: str) -> float:
+    """Return the sentinel best value for a minimization or maximization policy."""
+    selection = validate_checkpoint_selection(selection)
+    return math.inf if selection == "val_loss" else -math.inf
+
+
+def checkpoint_selection_improved(selection: str, candidate: float, best: float) -> bool:
+    """Return whether a finite candidate improves the requested selection metric."""
+    selection = validate_checkpoint_selection(selection)
+    candidate = float(candidate)
+    best = float(best)
+    if not math.isfinite(candidate):
+        raise FloatingPointError("Checkpoint-selection metric must be finite")
+    return candidate < best if selection == "val_loss" else candidate > best
 
 
 def plateau_early_stopping_config_from_args(args: argparse.Namespace) -> PlateauEarlyStoppingConfig:

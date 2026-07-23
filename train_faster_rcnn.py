@@ -18,12 +18,16 @@ import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from detection_metrics import xywhn_to_xyxy
+from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
 from models.faster_rcnn import build_faster_rcnn
 from training_control import (
     PlateauEarlyStopping,
+    add_checkpoint_selection_argument,
     add_plateau_early_stopping_arguments,
+    checkpoint_selection_improved,
+    initial_checkpoint_selection_value,
     plateau_early_stopping_config_from_args,
+    validate_checkpoint_selection,
 )
 from yolo_dataset_config import read_yolo_dataset_config
 
@@ -326,6 +330,57 @@ def run_epoch(
     return total / n, cls / n, box / n
 
 
+def validation_detection_metrics(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    num_classes: int,
+    use_amp: bool,
+) -> dict[str, Any]:
+    """Compute project mAP for optional checkpoint selection.
+
+    The validation loss remains the scheduler and early-stopping monitor. This
+    helper only decides which frozen checkpoint becomes ``best.pt``.
+    """
+    was_training = model.training
+    model.eval()
+    predictions: list[dict[str, torch.Tensor]] = []
+    targets_list: list[dict[str, torch.Tensor]] = []
+
+    try:
+        with torch.no_grad():
+            for images, targets in loader:
+                images_dev = [image.to(device, non_blocking=True) for image in images]
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    batch_predictions = model(images_dev)
+                if not isinstance(batch_predictions, list):
+                    raise RuntimeError("Faster R-CNN inference did not return a prediction list")
+
+                for prediction, target in zip(batch_predictions, targets):
+                    prediction_cpu = {
+                        "boxes": prediction["boxes"].detach().cpu().float(),
+                        "scores": prediction["scores"].detach().cpu().float(),
+                        "labels": (prediction["labels"].detach().cpu().long() - 1).clamp(min=0),
+                    }
+                    target_cpu = {
+                        "boxes": target["boxes"].detach().cpu().float(),
+                        "labels": (target["labels"].detach().cpu().long() - 1).clamp(min=0),
+                    }
+                    predictions.append(prediction_cpu)
+                    targets_list.append(target_cpu)
+    finally:
+        model.train(was_training)
+
+    if not predictions:
+        raise RuntimeError("No validation predictions were produced for checkpoint selection")
+    return compute_detection_metrics(
+        predictions=predictions,
+        targets=targets_list,
+        num_classes=num_classes,
+        conf_thresh=0.25,
+    )
+
+
 def build_optimizer(
     model: torch.nn.Module,
     lr: float,
@@ -428,6 +483,7 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for best.pt and last.pt checkpoints.",
     )
     add_plateau_early_stopping_arguments(parser)
+    add_checkpoint_selection_argument(parser)
     parser.add_argument("--dry-run", action="store_true", help="Validate data and configuration without training")
     return parser.parse_args()
 
@@ -456,6 +512,7 @@ def main() -> None:
     if args.backbone_weights == "imagenet" and args.scale not in {"s", "m"}:
         raise ValueError("--backbone-weights imagenet supports only --scale s or m")
     training_control_config = plateau_early_stopping_config_from_args(args)
+    checkpoint_selection = validate_checkpoint_selection(args.checkpoint_selection)
 
     device = torch.device(args.device)
     args.data_root = args.data_root.resolve()
@@ -596,6 +653,7 @@ def main() -> None:
     history_path = args.save_dir / "history.jsonl"
     history_path.write_text("", encoding="utf-8")
     best_val = float("inf")
+    best_selection_value = initial_checkpoint_selection_value(checkpoint_selection)
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_cls, train_box = run_epoch(
@@ -605,9 +663,28 @@ def main() -> None:
             model, valid_loader, optimizer=None, scaler=scaler, device=device, use_amp=use_amp,
         )
 
-        is_best = val_loss < best_val
-        if is_best:
+        selection_metrics: dict[str, Any] | None = None
+        if checkpoint_selection == "map50":
+            selection_metrics = validation_detection_metrics(
+                model=model,
+                loader=valid_loader,
+                device=device,
+                num_classes=num_classes,
+                use_amp=use_amp,
+            )
+            selection_value = float(selection_metrics["map50"])
+        else:
+            selection_value = val_loss
+
+        if val_loss < best_val:
             best_val = val_loss
+        is_best = checkpoint_selection_improved(
+            checkpoint_selection,
+            selection_value,
+            best_selection_value,
+        )
+        if is_best:
+            best_selection_value = selection_value
         control_step = training_control.step(val_loss)
         training_completed = control_step.should_stop or epoch == args.epochs
         stop_reason = (
@@ -634,6 +711,15 @@ def main() -> None:
             "model_inference_settings": model.inference_settings(),
             "backbone_initialization": model.backbone_initialization,
             "best_val_loss": best_val,
+            "checkpoint_selection": checkpoint_selection,
+            "checkpoint_selection_value": selection_value,
+            "best_checkpoint_selection_value": best_selection_value,
+            "validation_map50": (
+                float(selection_metrics["map50"]) if selection_metrics is not None else None
+            ),
+            "validation_map50_95": (
+                float(selection_metrics["map50_95"]) if selection_metrics is not None else None
+            ),
             "training_control": training_control.state_dict(),
             "learning_rates": list(control_step.learning_rates),
             "training_completed": training_completed,
@@ -652,6 +738,15 @@ def main() -> None:
             "val_cls_loss": val_cls,
             "val_box_loss": val_box,
             "best_val_loss": best_val,
+            "checkpoint_selection": checkpoint_selection,
+            "checkpoint_selection_value": selection_value,
+            "best_checkpoint_selection_value": best_selection_value,
+            "validation_map50": (
+                float(selection_metrics["map50"]) if selection_metrics is not None else None
+            ),
+            "validation_map50_95": (
+                float(selection_metrics["map50_95"]) if selection_metrics is not None else None
+            ),
             "learning_rates": list(control_step.learning_rates),
             "lr_reduced": control_step.lr_reduced,
             "early_stopping_bad_epochs": control_step.bad_epochs,
@@ -663,11 +758,17 @@ def main() -> None:
 
         lr_text = "/".join(f"{lr:.2e}" for lr in control_step.learning_rates)
         reduction_text = " lr_reduced=true" if control_step.lr_reduced else ""
+        selection_text = (
+            f" val_map50={float(selection_metrics['map50']):.4f}"
+            if selection_metrics is not None
+            else ""
+        )
         print(
             f"epoch={epoch}/{args.epochs} "
             f"train_loss={train_loss:.4f} train_cls={train_cls:.4f} train_box={train_box:.4f} "
             f"val_loss={val_loss:.4f} val_cls={val_cls:.4f} val_box={val_box:.4f} "
-            f"lr={lr_text} early_stop_bad_epochs={control_step.bad_epochs}{reduction_text}"
+            f"lr={lr_text} checkpoint_selection={checkpoint_selection}:{selection_value:.4f}"
+            f"{selection_text} early_stop_bad_epochs={control_step.bad_epochs}{reduction_text}"
         )
         if control_step.should_stop:
             print(

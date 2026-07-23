@@ -16,11 +16,16 @@ from ultralytics.utils.loss import BboxLoss
 from ultralytics.utils.ops import xywh2xyxy
 from ultralytics.utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors
 
-from models.yolo26_torch import build_yolo26
+from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
+from models.yolo26_torch import build_yolo26, class_aware_nms
 from training_control import (
     PlateauEarlyStopping,
+    add_checkpoint_selection_argument,
     add_plateau_early_stopping_arguments,
+    checkpoint_selection_improved,
+    initial_checkpoint_selection_value,
     plateau_early_stopping_config_from_args,
+    validate_checkpoint_selection,
 )
 from yolo_dataset_config import read_yolo_dataset_config
 
@@ -588,6 +593,74 @@ def run_epoch(
     return total_loss / num_batches, total_cls / num_batches, total_box / num_batches
 
 
+def validation_detection_metrics(
+    model: Any,
+    loader: DataLoader,
+    device: torch.device,
+    nc: int,
+    imgsz: int,
+    use_amp: bool,
+) -> dict[str, Any]:
+    """Compute project mAP on validation data using the selected one-to-many decoder.
+
+    This is intentionally separate from the validation-loss pass. Loss remains
+    the plateau/early-stopping signal, while mAP50 can optionally select the
+    checkpoint that is reported as ``best.pt``.
+    """
+    was_training = model.training
+    model.eval()
+    predictions: list[dict[str, torch.Tensor]] = []
+    targets_list: list[dict[str, torch.Tensor]] = []
+
+    try:
+        with torch.no_grad():
+            for images, targets in loader:
+                images = images.to(device, non_blocking=True)
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    outputs = model(images)
+                    decoded = model.detect.decode_branch(outputs["one2many"])
+
+                batch_predictions = class_aware_nms(
+                    decoded,
+                    num_classes=nc,
+                    score_threshold=0.001,
+                    iou_threshold=0.70,
+                    max_detections=300,
+                )
+                for prediction, target in zip(batch_predictions, targets):
+                    target_cpu = target.detach().cpu()
+                    gt_boxes = (
+                        xywhn_to_xyxy(target_cpu[:, 1:5], imgsz)
+                        if target_cpu.numel()
+                        else torch.zeros((0, 4), dtype=torch.float32)
+                    )
+                    gt_labels = (
+                        target_cpu[:, 0].long()
+                        if target_cpu.numel()
+                        else torch.zeros((0,), dtype=torch.long)
+                    )
+                    prediction_cpu = prediction.detach().cpu()
+                    predictions.append(
+                        {
+                            "boxes": prediction_cpu[:, :4].float(),
+                            "scores": prediction_cpu[:, 4].float(),
+                            "labels": prediction_cpu[:, 5].long(),
+                        }
+                    )
+                    targets_list.append({"boxes": gt_boxes, "labels": gt_labels})
+    finally:
+        model.train(was_training)
+
+    if not predictions:
+        raise RuntimeError("No validation predictions were produced for checkpoint selection")
+    return compute_detection_metrics(
+        predictions=predictions,
+        targets=targets_list,
+        num_classes=nc,
+        conf_thresh=0.25,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the custom YOLO26 model from scratch.")
     parser.add_argument("--data-root", type=Path, default=Path("processed-data/baseline"), help="Dataset variant root containing train/valid/test splits")
@@ -648,6 +721,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--one2one-topk", type=int, default=1, help="Task-aligned top-k for one-to-one assignment")
     parser.add_argument("--save-dir", type=Path, default=Path("runs/yolo26"), help="Output directory for checkpoints")
     add_plateau_early_stopping_arguments(parser)
+    add_checkpoint_selection_argument(parser)
     return parser.parse_args()
 
 
@@ -679,6 +753,7 @@ def main() -> None:
     if args.reg_max <= 0:
         raise ValueError("--reg-max must be positive")
     training_control_config = plateau_early_stopping_config_from_args(args)
+    checkpoint_selection = validate_checkpoint_selection(args.checkpoint_selection)
 
     train_dataset = YoloDetectionDataset(train_root, imgsz=args.imgsz, fraction=args.fraction)
     valid_dataset = YoloDetectionDataset(valid_root, imgsz=args.imgsz, fraction=args.fraction)
@@ -748,6 +823,7 @@ def main() -> None:
     last_path = args.save_dir / "last.pt"
 
     best_val = float("inf")
+    best_selection_value = initial_checkpoint_selection_value(checkpoint_selection)
     print(
         f"Training on device={device}, train_images={len(train_dataset)}, valid_images={len(valid_dataset)}, "
         f"seed={args.seed}"
@@ -805,9 +881,29 @@ def main() -> None:
             use_amp=use_amp,
         )
 
-        is_best = val_loss < best_val
-        if is_best:
+        selection_metrics: dict[str, Any] | None = None
+        if checkpoint_selection == "map50":
+            selection_metrics = validation_detection_metrics(
+                model=model,
+                loader=valid_loader,
+                device=device,
+                nc=args.num_classes,
+                imgsz=args.imgsz,
+                use_amp=use_amp,
+            )
+            selection_value = float(selection_metrics["map50"])
+        else:
+            selection_value = val_loss
+
+        if val_loss < best_val:
             best_val = val_loss
+        is_best = checkpoint_selection_improved(
+            checkpoint_selection,
+            selection_value,
+            best_selection_value,
+        )
+        if is_best:
+            best_selection_value = selection_value
         control_step = training_control.step(val_loss)
         training_completed = control_step.should_stop or epoch == args.epochs
         stop_reason = (
@@ -830,6 +926,15 @@ def main() -> None:
             "class_box_counts": class_box_counts,
             "class_positive_weights": class_positive_weights.detach().cpu(),
             "best_val_loss": best_val,
+            "checkpoint_selection": checkpoint_selection,
+            "checkpoint_selection_value": selection_value,
+            "best_checkpoint_selection_value": best_selection_value,
+            "validation_map50": (
+                float(selection_metrics["map50"]) if selection_metrics is not None else None
+            ),
+            "validation_map50_95": (
+                float(selection_metrics["map50_95"]) if selection_metrics is not None else None
+            ),
             "training_control": training_control.state_dict(),
             "learning_rates": list(control_step.learning_rates),
             "training_completed": training_completed,
@@ -841,11 +946,17 @@ def main() -> None:
 
         lr_text = "/".join(f"{lr:.2e}" for lr in control_step.learning_rates)
         reduction_text = " lr_reduced=true" if control_step.lr_reduced else ""
+        selection_text = (
+            f" val_map50={float(selection_metrics['map50']):.4f}"
+            if selection_metrics is not None
+            else ""
+        )
         print(
             f"epoch={epoch}/{args.epochs} "
             f"train_loss={train_loss:.4f} train_cls={train_cls:.4f} train_box={train_box:.4f} "
             f"val_loss={val_loss:.4f} val_cls={val_cls:.4f} val_box={val_box:.4f} "
-            f"lr={lr_text} early_stop_bad_epochs={control_step.bad_epochs}{reduction_text}"
+            f"lr={lr_text} checkpoint_selection={checkpoint_selection}:{selection_value:.4f}"
+            f"{selection_text} early_stop_bad_epochs={control_step.bad_epochs}{reduction_text}"
         )
         if control_step.should_stop:
             print(

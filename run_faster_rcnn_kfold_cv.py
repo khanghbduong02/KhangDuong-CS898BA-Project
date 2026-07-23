@@ -13,7 +13,13 @@ from typing import Any
 import torch
 
 from cv_utils import PROJECT_ROOT, discover_folds, project_path, render_fold_path, validate_cv_layout
-from training_control import add_plateau_early_stopping_arguments, plateau_early_stopping_config_from_args
+from training_control import (
+    DEFAULT_CHECKPOINT_SELECTION,
+    add_checkpoint_selection_argument,
+    add_plateau_early_stopping_arguments,
+    plateau_early_stopping_config_from_args,
+    validate_checkpoint_selection,
+)
 from yolo_dataset_config import YoloDatasetConfig
 
 
@@ -43,6 +49,7 @@ def training_settings(args: argparse.Namespace, num_classes: int) -> dict[str, A
         "min_lr": args.min_lr,
         "early_stopping_patience": args.early_stopping_patience,
         "early_stopping_min_delta": args.early_stopping_min_delta,
+        "checkpoint_selection": args.checkpoint_selection,
     }
 
 
@@ -99,6 +106,8 @@ def build_train_command(
         str(args.early_stopping_patience),
         "--early-stopping-min-delta",
         str(args.early_stopping_min_delta),
+        "--checkpoint-selection",
+        args.checkpoint_selection,
         "--save-dir",
         str(run_dir),
     ]
@@ -150,6 +159,9 @@ def completed_run_matches(
         # Pre-P2 checkpoints use the historical P3--P6 FPN.
         if key == "use_p2" and actual is None:
             actual = False
+        # Historical checkpoints selected best.pt by validation loss.
+        if key == "checkpoint_selection" and actual is None:
+            actual = DEFAULT_CHECKPOINT_SELECTION
         if not values_match(expected, actual):
             mismatches.append(f"{key}: expected {expected!r}, found {actual!r}")
 
@@ -245,6 +257,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balanced-sampling", action="store_true")
     parser.add_argument("--balanced-sampling-power", type=float, default=1.0)
     add_plateau_early_stopping_arguments(parser)
+    add_checkpoint_selection_argument(parser)
     parser.add_argument(
         "--force",
         action="store_true",
@@ -274,6 +287,7 @@ def main() -> None:
     if args.backbone_weights == "imagenet" and args.scale not in {"s", "m"}:
         raise ValueError("--backbone-weights imagenet supports only --scale s or m")
     plateau_early_stopping_config_from_args(args)
+    validate_checkpoint_selection(args.checkpoint_selection)
     if not args.data_root.is_dir():
         raise FileNotFoundError(f"Data root does not exist: {args.data_root}")
 

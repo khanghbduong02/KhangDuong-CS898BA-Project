@@ -8,7 +8,12 @@ from torch.optim import SGD
 
 from run_faster_rcnn_kfold_cv import completed_run_matches as faster_rcnn_completed_run_matches
 from run_yolo26_kfold_cv import completed_run_matches as yolo26_completed_run_matches
-from training_control import PlateauEarlyStopping, PlateauEarlyStoppingConfig
+from training_control import (
+    PlateauEarlyStopping,
+    PlateauEarlyStoppingConfig,
+    checkpoint_selection_improved,
+    initial_checkpoint_selection_value,
+)
 
 
 def _optimizer(lr: float = 0.1) -> SGD:
@@ -113,6 +118,22 @@ def test_disabled_controls_remain_inert() -> None:
     assert control.state_dict()["scheduler_state_dict"] is None
 
 
+def test_checkpoint_selection_modes() -> None:
+    """Loss and mAP50 selection optimize in their respective directions."""
+    assert initial_checkpoint_selection_value("val_loss") == float("inf")
+    assert initial_checkpoint_selection_value("map50") == float("-inf")
+    assert checkpoint_selection_improved("val_loss", 1.0, 2.0)
+    assert not checkpoint_selection_improved("val_loss", 2.0, 1.0)
+    assert checkpoint_selection_improved("map50", 0.30, 0.20)
+    assert not checkpoint_selection_improved("map50", 0.20, 0.30)
+    try:
+        checkpoint_selection_improved("unknown", 1.0, 0.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("An unsupported checkpoint-selection mode was accepted")
+
+
 def test_kfold_runners_accept_early_stopped_checkpoints() -> None:
     """An early-stopped `last.pt` is complete when its frozen settings match."""
     for matcher in (yolo26_completed_run_matches, faster_rcnn_completed_run_matches):
@@ -137,7 +158,7 @@ def test_kfold_runners_accept_early_stopped_checkpoints() -> None:
             matches, epoch, completed, mismatches = matcher(
                 checkpoint_path,
                 fold_root,
-                {"epochs": 150, "use_p2": True},
+                {"epochs": 150, "use_p2": True, "checkpoint_selection": "val_loss"},
                 ("defect",),
             )
             assert matches, mismatches
@@ -154,6 +175,8 @@ def main() -> None:
     print("early_stopping_after_no_effective_lr_reduction: passed")
     test_disabled_controls_remain_inert()
     print("disabled_controls_remain_inert: passed")
+    test_checkpoint_selection_modes()
+    print("checkpoint_selection_modes: passed")
     test_kfold_runners_accept_early_stopped_checkpoints()
     print("kfold_runners_accept_early_stopped_checkpoints: passed")
 
