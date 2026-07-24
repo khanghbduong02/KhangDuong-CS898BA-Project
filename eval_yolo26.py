@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
+from inference_tta import horizontal_flip_images, unflip_decoded_xyxy
 from models.yolo26_torch import build_yolo26, class_aware_nms
 from train_yolo26 import E2EDetectLoss, YoloDetectionDataset, collate_fn, compute_loss
 from yolo_dataset_config import read_yolo_dataset_config
@@ -83,6 +84,14 @@ def parse_args() -> argparse.Namespace:
         help="Maximum detections retained per image after postprocessing",
     )
     parser.add_argument(
+        "--tta-hflip",
+        action="store_true",
+        help=(
+            "Run horizontal-flip test-time augmentation and merge original/flipped raw detections "
+            "with class-aware NMS"
+        ),
+    )
+    parser.add_argument(
         "--metrics-output",
         type=Path,
         default=None,
@@ -150,6 +159,8 @@ def main() -> None:
         raise ValueError("--max-det must be positive")
     if args.postprocess == "legacy_topk" and args.inference_branch != "one2one":
         raise ValueError("--postprocess legacy_topk is available only for the historical one2one branch")
+    if args.tta_hflip and args.postprocess != "class_aware_nms":
+        raise ValueError("--tta-hflip requires --postprocess class_aware_nms")
 
     split_root = args.data_root / args.split
     if not split_root.exists():
@@ -235,7 +246,8 @@ def main() -> None:
         f"one2many_topk={one2many_topk} one2one_topk={one2one_topk} "
         f"positive_class_weights=({class_weight_summary}) postprocess={args.postprocess} "
         f"inference_branch={args.inference_branch} "
-        f"nms_iou={args.nms_iou:g} nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det}"
+        f"nms_iou={args.nms_iou:g} nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det} "
+        f"tta_hflip={args.tta_hflip}"
     )
     model.eval()
     total_loss = 0.0
@@ -269,6 +281,14 @@ def main() -> None:
                 batch_preds = [prediction.detach().cpu() for prediction in outputs["one_to_one"]]
             else:
                 decoded = model.detect.decode_branch(outputs[args.inference_branch])
+                if args.tta_hflip:
+                    with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
+                        flipped_outputs = model(horizontal_flip_images(images))
+                    flipped_decoded = model.detect.decode_branch(flipped_outputs[args.inference_branch])
+                    decoded = torch.cat(
+                        (decoded, unflip_decoded_xyxy(flipped_decoded, image_width=images.shape[-1])),
+                        dim=2,
+                    )
                 batch_preds = [
                     prediction.detach().cpu()
                     for prediction in class_aware_nms(
@@ -333,6 +353,7 @@ def main() -> None:
                 "nms_iou": args.nms_iou,
                 "nms_score_threshold": args.nms_score_thresh,
                 "max_detections": args.max_det,
+                "tta_hflip": args.tta_hflip,
             },
             "metrics": metrics,
         }

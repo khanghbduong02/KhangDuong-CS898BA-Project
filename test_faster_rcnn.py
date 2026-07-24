@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from torchvision.models import resnet18
 
+from inference_tta import merge_hflip_predictions
 from models.faster_rcnn import (
     P2_ANCHOR_SIZES,
     P2_ANCHOR_STRIDES,
@@ -128,6 +129,37 @@ def test_p2_fpn_assignment_and_model() -> None:
     assert len(predictions) == len(images)
 
 
+def test_hflip_prediction_merge() -> None:
+    """Merge original and flipped per-class predictions without cross-class suppression."""
+    original = [
+        {
+            "boxes": torch.tensor([[10.0, 10.0, 30.0, 30.0], [10.0, 10.0, 30.0, 30.0]]),
+            "scores": torch.tensor([0.9, 0.7]),
+            "labels": torch.tensor([1, 2]),
+        }
+    ]
+    flipped = [
+        {
+            "boxes": torch.tensor([[70.0, 10.0, 90.0, 30.0], [40.0, 10.0, 60.0, 30.0]]),
+            "scores": torch.tensor([0.8, 0.6]),
+            "labels": torch.tensor([1, 1]),
+        }
+    ]
+    merged = merge_hflip_predictions(
+        original,
+        flipped,
+        image_widths=[100],
+        nms_iou=0.70,
+        max_detections=300,
+    )[0]
+    assert merged["labels"].tolist() == [1, 2, 1]
+    assert torch.allclose(merged["scores"], torch.tensor([0.9, 0.7, 0.6]))
+    assert torch.allclose(
+        merged["boxes"],
+        torch.tensor([[10.0, 10.0, 30.0, 30.0], [10.0, 10.0, 30.0, 30.0], [40.0, 10.0, 60.0, 30.0]]),
+    )
+
+
 def test_model_train_validation_and_inference() -> None:
     """Exercise finite loss/backprop, frozen validation BatchNorm, and NMS output."""
     model = build_faster_rcnn(
@@ -184,6 +216,8 @@ def main() -> None:
     print("torchvision_resnet_mapping: passed")
     test_p2_fpn_assignment_and_model()
     print("p2_fpn_assignment_and_model: passed")
+    test_hflip_prediction_merge()
+    print("hflip_prediction_merge: passed")
     test_model_train_validation_and_inference()
     print("faster_rcnn_model_smoke: passed")
 

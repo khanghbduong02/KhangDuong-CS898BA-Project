@@ -26,7 +26,7 @@ def build_eval_command(
     fold_root: Path,
     metrics_output: Path,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "eval_yolo26.py",
         "--checkpoint",
@@ -60,6 +60,9 @@ def build_eval_command(
         "--metrics-output",
         str(metrics_output),
     ]
+    if args.tta_hflip:
+        command.append("--tta-hflip")
+    return command
 
 
 def required_float(payload: dict[str, Any], key: str, context: str) -> float:
@@ -203,6 +206,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nms-iou", type=float, default=0.70)
     parser.add_argument("--nms-score-thresh", type=float, default=0.001)
     parser.add_argument("--max-det", type=int, default=300)
+    parser.add_argument("--tta-hflip", action="store_true", help="Use horizontal-flip test-time augmentation")
     parser.add_argument("--output", type=Path, default=None, help="Aggregate JSON path; defaults beneath --run-root")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and print commands without evaluation")
     return parser.parse_args()
@@ -226,6 +230,8 @@ def main() -> None:
         raise ValueError("--max-det must be positive")
     if args.postprocess == "legacy_topk" and args.inference_branch != "one2one":
         raise ValueError("--postprocess legacy_topk is available only for --inference-branch one2one")
+    if args.tta_hflip and args.postprocess != "class_aware_nms":
+        raise ValueError("--tta-hflip requires --postprocess class_aware_nms")
     if not args.data_root.is_dir():
         raise FileNotFoundError(f"Data root does not exist: {args.data_root}")
 
@@ -236,7 +242,7 @@ def main() -> None:
         project_path(args.output)
         if args.output is not None
         else args.run_root
-        / f"cv_evaluation_{args.split}_{args.inference_branch}_{args.postprocess}_conf_{confidence_tag(args.conf_thresh)}.json"
+        / f"cv_evaluation_{args.split}_{args.inference_branch}_{args.postprocess}{'_tta_hflip' if args.tta_hflip else ''}_conf_{confidence_tag(args.conf_thresh)}.json"
     )
 
     per_fold: list[dict[str, Any]] = []
@@ -244,7 +250,7 @@ def main() -> None:
         fold_root = fold_roots[fold]
         checkpoint = render_fold_path(args.run_root, args.checkpoint_template, fold)
         metrics_output = checkpoint.parent / (
-            f"{args.split}_metrics_{args.inference_branch}_{args.postprocess}_conf_{confidence_tag(args.conf_thresh)}.json"
+            f"{args.split}_metrics_{args.inference_branch}_{args.postprocess}{'_tta_hflip' if args.tta_hflip else ''}_conf_{confidence_tag(args.conf_thresh)}.json"
         )
         command = build_eval_command(args, checkpoint, fold_root, metrics_output)
         print(f"\n===== CUSTOM YOLO26 EVALUATE FOLD {fold}/{len(folds)} =====", flush=True)
@@ -283,6 +289,7 @@ def main() -> None:
             "nms_iou": args.nms_iou,
             "nms_score_threshold": args.nms_score_thresh,
             "max_detections": args.max_det,
+            "tta_hflip": args.tta_hflip,
         },
         "dataset": {
             "num_classes": dataset_config.num_classes,

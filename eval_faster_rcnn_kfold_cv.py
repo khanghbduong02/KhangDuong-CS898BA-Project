@@ -26,7 +26,7 @@ def build_eval_command(
     fold_root: Path,
     metrics_output: Path,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "eval_faster_rcnn.py",
         "--checkpoint",
@@ -56,6 +56,9 @@ def build_eval_command(
         "--metrics-output",
         str(metrics_output),
     ]
+    if args.tta_hflip:
+        command.append("--tta-hflip")
+    return command
 
 
 def required_float(payload: dict[str, Any], key: str, context: str) -> float:
@@ -188,6 +191,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nms-iou", type=float, default=0.70)
     parser.add_argument("--nms-score-thresh", type=float, default=0.001)
     parser.add_argument("--max-det", type=int, default=300)
+    parser.add_argument("--tta-hflip", action="store_true", help="Use horizontal-flip test-time augmentation")
     parser.add_argument("--output", type=Path, default=None, help="Aggregate JSON path; defaults beneath --run-root")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and print commands without evaluation")
     return parser.parse_args()
@@ -221,7 +225,7 @@ def main() -> None:
     args.output = (
         project_path(args.output)
         if args.output is not None
-        else args.run_root / f"cv_evaluation_{args.split}_per_class_nms_conf_{confidence_tag(args.conf_thresh)}.json"
+        else args.run_root / f"cv_evaluation_{args.split}_per_class_nms{'_tta_hflip' if args.tta_hflip else ''}_conf_{confidence_tag(args.conf_thresh)}.json"
     )
 
     per_fold: list[dict[str, Any]] = []
@@ -229,7 +233,7 @@ def main() -> None:
         fold_root = fold_roots[fold]
         checkpoint = render_fold_path(args.run_root, args.checkpoint_template, fold)
         metrics_output = checkpoint.parent / (
-            f"{args.split}_metrics_per_class_nms_conf_{confidence_tag(args.conf_thresh)}.json"
+            f"{args.split}_metrics_per_class_nms{'_tta_hflip' if args.tta_hflip else ''}_conf_{confidence_tag(args.conf_thresh)}.json"
         )
         command = build_eval_command(args, checkpoint, fold_root, metrics_output)
         print(f"\n===== CUSTOM FASTER R-CNN EVALUATE FOLD {position}/{len(folds)} (fold_{fold}) =====", flush=True)
@@ -267,6 +271,7 @@ def main() -> None:
             "nms_iou": args.nms_iou,
             "nms_score_threshold": args.nms_score_thresh,
             "max_det": args.max_det,
+            "tta_hflip": args.tta_hflip,
         },
         "dataset": {
             "num_classes": dataset_config.num_classes,

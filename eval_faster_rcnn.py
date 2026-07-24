@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from detection_metrics import compute_detection_metrics
+from inference_tta import merge_hflip_predictions
 from models.faster_rcnn import build_faster_rcnn
 from train_faster_rcnn import FasterRCNNDataset, collate_fn
 from yolo_dataset_config import read_yolo_dataset_config
@@ -100,6 +101,11 @@ def parse_args() -> argparse.Namespace:
                         help="Per-class NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=300,
                         help="Maximum detections retained per image after NMS")
+    parser.add_argument(
+        "--tta-hflip",
+        action="store_true",
+        help="Run horizontal-flip test-time augmentation and merge original/flipped detections with per-class NMS",
+    )
     parser.add_argument(
         "--metrics-output",
         type=Path,
@@ -257,6 +263,18 @@ def main() -> None:
             preds = model(images_dev)
             if not isinstance(preds, list):
                 raise RuntimeError("Faster R-CNN inference did not return a prediction list")
+            if args.tta_hflip:
+                flipped_images = [torch.flip(image, dims=(-1,)) for image in images_dev]
+                flipped_preds = model(flipped_images)
+                if not isinstance(flipped_preds, list):
+                    raise RuntimeError("Faster R-CNN flipped inference did not return a prediction list")
+                preds = merge_hflip_predictions(
+                    preds,
+                    flipped_preds,
+                    [int(image.shape[-1]) for image in images_dev],
+                    nms_iou=args.nms_iou,
+                    max_detections=args.max_det,
+                )
 
             for pred, tgt in zip(preds, targets):
                 # The local Faster R-CNN model reserves class 0 for background.
@@ -310,6 +328,7 @@ def main() -> None:
                 "nms_iou": args.nms_iou,
                 "nms_score_threshold": args.nms_score_thresh,
                 "max_det": args.max_det,
+                "tta_hflip": args.tta_hflip,
             },
             "metrics": metrics,
         }
@@ -320,7 +339,7 @@ def main() -> None:
         f"Evaluation settings: scale={scale} imgsz={imgsz} use_p2={use_p2} "
         f"backbone_weights={backbone_weights} backbone_initialization={backbone_initialization} "
         f"postprocess=per_class_nms nms_iou={args.nms_iou:g} "
-        f"nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det}"
+        f"nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det} tta_hflip={args.tta_hflip}"
     )
     print(
         f"model=faster_rcnn (scale={scale}) split={args.split} images={len(dataset)} "

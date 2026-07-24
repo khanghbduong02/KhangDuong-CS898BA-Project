@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import torch
 
+from inference_tta import unflip_decoded_xyxy
 from models.yolo26_torch import DistributionIntegral, build_yolo26, class_aware_nms
 from train_yolo26 import E2EDetectLoss, build_positive_class_weights, compute_loss
 
@@ -46,6 +47,19 @@ def test_distribution_integral() -> None:
 	distances = DistributionIntegral(reg_max)(logits)
 	expected = torch.tensor([[[0.0], [1.0], [2.0], [3.0]]])
 	assert torch.allclose(distances, expected, atol=1e-4)
+
+
+def test_hflip_decoded_unflip() -> None:
+	"""Horizontal-flip decoded boxes must map back while retaining class scores."""
+	flipped = torch.tensor(
+		[[[70.0, 20.0], [10.0, 11.0], [90.0, 40.0], [30.0, 31.0], [0.9, 0.8], [0.1, 0.2]]]
+	)
+	restored = unflip_decoded_xyxy(flipped, image_width=100)
+	expected = torch.tensor(
+		[[[10.0, 60.0], [10.0, 11.0], [30.0, 80.0], [30.0, 31.0], [0.9, 0.8], [0.1, 0.2]]]
+	)
+	assert torch.equal(restored, expected)
+	assert torch.equal(unflip_decoded_xyxy(restored, image_width=100), flipped)
 
 
 def test_neutral_class_weights_allow_missing_smoke_classes() -> None:
@@ -127,6 +141,8 @@ def main() -> None:
 	print("class_aware_nms: passed")
 	test_distribution_integral()
 	print("distribution_integral: passed")
+	test_hflip_decoded_unflip()
+	print("hflip_decoded_unflip: passed")
 	test_neutral_class_weights_allow_missing_smoke_classes()
 	print("neutral_smoke_class_weights: passed")
 
