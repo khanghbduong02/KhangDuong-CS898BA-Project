@@ -21,13 +21,17 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
 from models.faster_rcnn import build_faster_rcnn
 from training_control import (
+    EpochLRScheduler,
     PlateauEarlyStopping,
     add_checkpoint_selection_argument,
+    add_epoch_lr_schedule_arguments,
     add_plateau_early_stopping_arguments,
     checkpoint_selection_improved,
+    epoch_lr_schedule_config_from_args,
     initial_checkpoint_selection_value,
     plateau_early_stopping_config_from_args,
     validate_checkpoint_selection,
+    validate_training_control_compatibility,
 )
 from yolo_dataset_config import read_yolo_dataset_config
 
@@ -483,6 +487,7 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for best.pt and last.pt checkpoints.",
     )
     add_plateau_early_stopping_arguments(parser)
+    add_epoch_lr_schedule_arguments(parser)
     add_checkpoint_selection_argument(parser)
     parser.add_argument("--dry-run", action="store_true", help="Validate data and configuration without training")
     return parser.parse_args()
@@ -512,6 +517,8 @@ def main() -> None:
     if args.backbone_weights == "imagenet" and args.scale not in {"s", "m"}:
         raise ValueError("--backbone-weights imagenet supports only --scale s or m")
     training_control_config = plateau_early_stopping_config_from_args(args)
+    epoch_lr_schedule_config = epoch_lr_schedule_config_from_args(args)
+    validate_training_control_compatibility(training_control_config, epoch_lr_schedule_config)
     checkpoint_selection = validate_checkpoint_selection(args.checkpoint_selection)
 
     device = torch.device(args.device)
@@ -598,6 +605,11 @@ def main() -> None:
         backbone_lr_multiplier=args.backbone_lr_multiplier,
     )
     training_control = PlateauEarlyStopping(optimizer, training_control_config)
+    epoch_lr_scheduler = (
+        EpochLRScheduler(optimizer, epoch_lr_schedule_config)
+        if epoch_lr_schedule_config.enabled
+        else None
+    )
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
@@ -635,6 +647,15 @@ def main() -> None:
         )
     else:
         print("Training control: ReduceLROnPlateau and early stopping disabled")
+    if epoch_lr_scheduler is None:
+        print("Epoch LR schedule: constant learning rate without warmup")
+    else:
+        print(
+            f"Epoch LR schedule: {epoch_lr_schedule_config.schedule} "
+            f"warmup_epochs={epoch_lr_schedule_config.warmup_epochs} "
+            f"warmup_start_factor={epoch_lr_schedule_config.warmup_start_factor:g} "
+            f"cosine_final_factor={epoch_lr_schedule_config.cosine_final_factor:g}"
+        )
     if sampler_counts is not None:
         count_summary = ", ".join(
             f"class_{class_id}:{count}" for class_id, count in enumerate(sampler_counts)
@@ -656,6 +677,9 @@ def main() -> None:
     best_selection_value = initial_checkpoint_selection_value(checkpoint_selection)
 
     for epoch in range(1, args.epochs + 1):
+        epoch_schedule_step = (
+            epoch_lr_scheduler.set_epoch(epoch) if epoch_lr_scheduler is not None else None
+        )
         train_loss, train_cls, train_box = run_epoch(
             model, train_loader, optimizer, scaler, device, use_amp=use_amp,
         )
@@ -696,7 +720,7 @@ def main() -> None:
         )
 
         checkpoint: Dict[str, Any] = {
-            "format_version": 3,
+            "format_version": 4,
             "model_name": "custom_faster_rcnn",
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -721,6 +745,9 @@ def main() -> None:
                 float(selection_metrics["map50_95"]) if selection_metrics is not None else None
             ),
             "training_control": training_control.state_dict(),
+            "epoch_lr_schedule": (
+                epoch_lr_scheduler.state_dict() if epoch_lr_scheduler is not None else None
+            ),
             "learning_rates": list(control_step.learning_rates),
             "training_completed": training_completed,
             "stop_reason": stop_reason,
@@ -748,6 +775,9 @@ def main() -> None:
                 float(selection_metrics["map50_95"]) if selection_metrics is not None else None
             ),
             "learning_rates": list(control_step.learning_rates),
+            "lr_schedule_factor": (
+                epoch_schedule_step.factor if epoch_schedule_step is not None else 1.0
+            ),
             "lr_reduced": control_step.lr_reduced,
             "early_stopping_bad_epochs": control_step.bad_epochs,
             "training_completed": training_completed,
@@ -758,6 +788,11 @@ def main() -> None:
 
         lr_text = "/".join(f"{lr:.2e}" for lr in control_step.learning_rates)
         reduction_text = " lr_reduced=true" if control_step.lr_reduced else ""
+        schedule_text = (
+            f" lr_schedule_factor={epoch_schedule_step.factor:.4f}"
+            if epoch_schedule_step is not None
+            else ""
+        )
         selection_text = (
             f" val_map50={float(selection_metrics['map50']):.4f}"
             if selection_metrics is not None
@@ -768,7 +803,7 @@ def main() -> None:
             f"train_loss={train_loss:.4f} train_cls={train_cls:.4f} train_box={train_box:.4f} "
             f"val_loss={val_loss:.4f} val_cls={val_cls:.4f} val_box={val_box:.4f} "
             f"lr={lr_text} checkpoint_selection={checkpoint_selection}:{selection_value:.4f}"
-            f"{selection_text} early_stop_bad_epochs={control_step.bad_epochs}{reduction_text}"
+            f"{selection_text} early_stop_bad_epochs={control_step.bad_epochs}{reduction_text}{schedule_text}"
         )
         if control_step.should_stop:
             print(

@@ -19,13 +19,17 @@ from ultralytics.utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors
 from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
 from models.yolo26_torch import build_yolo26, class_aware_nms
 from training_control import (
+    EpochLRScheduler,
     PlateauEarlyStopping,
     add_checkpoint_selection_argument,
+    add_epoch_lr_schedule_arguments,
     add_plateau_early_stopping_arguments,
     checkpoint_selection_improved,
+    epoch_lr_schedule_config_from_args,
     initial_checkpoint_selection_value,
     plateau_early_stopping_config_from_args,
     validate_checkpoint_selection,
+    validate_training_control_compatibility,
 )
 from yolo_dataset_config import read_yolo_dataset_config
 
@@ -721,6 +725,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--one2one-topk", type=int, default=1, help="Task-aligned top-k for one-to-one assignment")
     parser.add_argument("--save-dir", type=Path, default=Path("runs/yolo26"), help="Output directory for checkpoints")
     add_plateau_early_stopping_arguments(parser)
+    add_epoch_lr_schedule_arguments(parser)
     add_checkpoint_selection_argument(parser)
     return parser.parse_args()
 
@@ -753,6 +758,8 @@ def main() -> None:
     if args.reg_max <= 0:
         raise ValueError("--reg-max must be positive")
     training_control_config = plateau_early_stopping_config_from_args(args)
+    epoch_lr_schedule_config = epoch_lr_schedule_config_from_args(args)
+    validate_training_control_compatibility(training_control_config, epoch_lr_schedule_config)
     checkpoint_selection = validate_checkpoint_selection(args.checkpoint_selection)
 
     train_dataset = YoloDetectionDataset(train_root, imgsz=args.imgsz, fraction=args.fraction)
@@ -802,6 +809,11 @@ def main() -> None:
     model_strides = tuple(int(stride) for stride in model.detect.stride.detach().cpu().tolist())
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     training_control = PlateauEarlyStopping(optimizer, training_control_config)
+    epoch_lr_scheduler = (
+        EpochLRScheduler(optimizer, epoch_lr_schedule_config)
+        if epoch_lr_schedule_config.enabled
+        else None
+    )
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
     criterion = E2EDetectLoss(
         nc=args.num_classes,
@@ -852,6 +864,15 @@ def main() -> None:
         )
     else:
         print("Training control: ReduceLROnPlateau and early stopping disabled")
+    if epoch_lr_scheduler is None:
+        print("Epoch LR schedule: constant learning rate without warmup")
+    else:
+        print(
+            f"Epoch LR schedule: {epoch_lr_schedule_config.schedule} "
+            f"warmup_epochs={epoch_lr_schedule_config.warmup_epochs} "
+            f"warmup_start_factor={epoch_lr_schedule_config.warmup_start_factor:g} "
+            f"cosine_final_factor={epoch_lr_schedule_config.cosine_final_factor:g}"
+        )
     if sampler_counts is not None:
         count_summary = ", ".join(f"class_{class_id}:{count}" for class_id, count in enumerate(sampler_counts))
         print(
@@ -860,6 +881,9 @@ def main() -> None:
         )
 
     for epoch in range(1, args.epochs + 1):
+        epoch_schedule_step = (
+            epoch_lr_scheduler.set_epoch(epoch) if epoch_lr_scheduler is not None else None
+        )
         train_loss, train_cls, train_box = run_epoch(
             model,
             train_loader,
@@ -915,7 +939,7 @@ def main() -> None:
         )
 
         checkpoint = {
-            "format_version": 2,
+            "format_version": 3,
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -936,6 +960,9 @@ def main() -> None:
                 float(selection_metrics["map50_95"]) if selection_metrics is not None else None
             ),
             "training_control": training_control.state_dict(),
+            "epoch_lr_schedule": (
+                epoch_lr_scheduler.state_dict() if epoch_lr_scheduler is not None else None
+            ),
             "learning_rates": list(control_step.learning_rates),
             "training_completed": training_completed,
             "stop_reason": stop_reason,
@@ -946,6 +973,11 @@ def main() -> None:
 
         lr_text = "/".join(f"{lr:.2e}" for lr in control_step.learning_rates)
         reduction_text = " lr_reduced=true" if control_step.lr_reduced else ""
+        schedule_text = (
+            f" lr_schedule_factor={epoch_schedule_step.factor:.4f}"
+            if epoch_schedule_step is not None
+            else ""
+        )
         selection_text = (
             f" val_map50={float(selection_metrics['map50']):.4f}"
             if selection_metrics is not None
@@ -956,7 +988,7 @@ def main() -> None:
             f"train_loss={train_loss:.4f} train_cls={train_cls:.4f} train_box={train_box:.4f} "
             f"val_loss={val_loss:.4f} val_cls={val_cls:.4f} val_box={val_box:.4f} "
             f"lr={lr_text} checkpoint_selection={checkpoint_selection}:{selection_value:.4f}"
-            f"{selection_text} early_stop_bad_epochs={control_step.bad_epochs}{reduction_text}"
+            f"{selection_text} early_stop_bad_epochs={control_step.bad_epochs}{reduction_text}{schedule_text}"
         )
         if control_step.should_stop:
             print(

@@ -9,10 +9,13 @@ from torch.optim import SGD
 from run_faster_rcnn_kfold_cv import completed_run_matches as faster_rcnn_completed_run_matches
 from run_yolo26_kfold_cv import completed_run_matches as yolo26_completed_run_matches
 from training_control import (
+    EpochLRScheduleConfig,
+    EpochLRScheduler,
     PlateauEarlyStopping,
     PlateauEarlyStoppingConfig,
     checkpoint_selection_improved,
     initial_checkpoint_selection_value,
+    validate_training_control_compatibility,
 )
 
 
@@ -118,6 +121,46 @@ def test_disabled_controls_remain_inert() -> None:
     assert control.state_dict()["scheduler_state_dict"] is None
 
 
+def test_warmup_cosine_schedule() -> None:
+    """Warmup reaches the base rate before a deterministic cosine decay."""
+    optimizer = _optimizer(lr=0.1)
+    schedule = EpochLRScheduler(
+        optimizer,
+        EpochLRScheduleConfig(
+            total_epochs=6,
+            schedule="cosine",
+            warmup_epochs=3,
+            warmup_start_factor=0.1,
+            cosine_final_factor=0.2,
+        ),
+    )
+    expected = ((1, 0.1, 0.01), (2, 0.55, 0.055), (3, 1.0, 0.1), (4, 1.0, 0.1), (5, 0.6, 0.06), (6, 0.2, 0.02))
+    for epoch, factor, lr in expected:
+        step = schedule.set_epoch(epoch)
+        assert abs(step.factor - factor) < 1e-12
+        assert len(step.learning_rates) == 1
+        assert abs(step.learning_rates[0] - lr) < 1e-12
+    assert schedule.state_dict()["last_epoch"] == 6
+
+
+def test_epoch_schedule_requires_disabled_plateau() -> None:
+    """Do not mix a deterministic epoch schedule with validation-driven reductions."""
+    plateau_config = PlateauEarlyStoppingConfig(
+        reduce_lr_patience=1,
+        reduce_lr_factor=0.5,
+        reduce_lr_cooldown=0,
+        min_lr=1e-6,
+        early_stopping_patience=2,
+    )
+    schedule_config = EpochLRScheduleConfig(total_epochs=10, schedule="cosine")
+    try:
+        validate_training_control_compatibility(plateau_config, schedule_config)
+    except ValueError as exc:
+        assert "requires --reduce-lr-patience 0" in str(exc)
+    else:
+        raise AssertionError("A deterministic epoch schedule was mixed with plateau control")
+
+
 def test_checkpoint_selection_modes() -> None:
     """Loss and mAP50 selection optimize in their respective directions."""
     assert initial_checkpoint_selection_value("val_loss") == float("inf")
@@ -158,7 +201,15 @@ def test_kfold_runners_accept_early_stopped_checkpoints() -> None:
             matches, epoch, completed, mismatches = matcher(
                 checkpoint_path,
                 fold_root,
-                {"epochs": 150, "use_p2": True, "checkpoint_selection": "val_loss"},
+                {
+                    "epochs": 150,
+                    "use_p2": True,
+                    "checkpoint_selection": "val_loss",
+                    "lr_schedule": "constant",
+                    "warmup_epochs": 0,
+                    "warmup_start_factor": 0.1,
+                    "cosine_final_factor": 0.02,
+                },
                 ("defect",),
             )
             assert matches, mismatches
@@ -175,6 +226,10 @@ def main() -> None:
     print("early_stopping_after_no_effective_lr_reduction: passed")
     test_disabled_controls_remain_inert()
     print("disabled_controls_remain_inert: passed")
+    test_warmup_cosine_schedule()
+    print("warmup_cosine_schedule: passed")
+    test_epoch_schedule_requires_disabled_plateau()
+    print("epoch_schedule_requires_disabled_plateau: passed")
     test_checkpoint_selection_modes()
     print("checkpoint_selection_modes: passed")
     test_kfold_runners_accept_early_stopped_checkpoints()

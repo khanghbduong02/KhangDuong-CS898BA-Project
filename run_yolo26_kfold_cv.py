@@ -15,10 +15,17 @@ import torch
 from cv_utils import PROJECT_ROOT, discover_folds, project_path, render_fold_path, validate_cv_layout
 from training_control import (
     DEFAULT_CHECKPOINT_SELECTION,
+    DEFAULT_COSINE_FINAL_FACTOR,
+    DEFAULT_LR_SCHEDULE,
+    DEFAULT_WARMUP_EPOCHS,
+    DEFAULT_WARMUP_START_FACTOR,
     add_checkpoint_selection_argument,
+    add_epoch_lr_schedule_arguments,
     add_plateau_early_stopping_arguments,
+    epoch_lr_schedule_config_from_args,
     plateau_early_stopping_config_from_args,
     validate_checkpoint_selection,
+    validate_training_control_compatibility,
 )
 from yolo_dataset_config import YoloDatasetConfig
 
@@ -54,6 +61,10 @@ def training_settings(args: argparse.Namespace, num_classes: int) -> dict[str, A
         "min_lr": args.min_lr,
         "early_stopping_patience": args.early_stopping_patience,
         "early_stopping_min_delta": args.early_stopping_min_delta,
+        "lr_schedule": args.lr_schedule,
+        "warmup_epochs": args.warmup_epochs,
+        "warmup_start_factor": args.warmup_start_factor,
+        "cosine_final_factor": args.cosine_final_factor,
         "checkpoint_selection": args.checkpoint_selection,
     }
 
@@ -121,6 +132,14 @@ def build_train_command(
         str(args.early_stopping_patience),
         "--early-stopping-min-delta",
         str(args.early_stopping_min_delta),
+        "--lr-schedule",
+        args.lr_schedule,
+        "--warmup-epochs",
+        str(args.warmup_epochs),
+        "--warmup-start-factor",
+        str(args.warmup_start_factor),
+        "--cosine-final-factor",
+        str(args.cosine_final_factor),
         "--checkpoint-selection",
         args.checkpoint_selection,
         "--save-dir",
@@ -180,6 +199,15 @@ def completed_run_matches(
         # Historical checkpoints selected best.pt by validation loss.
         if key == "checkpoint_selection" and actual is None:
             actual = DEFAULT_CHECKPOINT_SELECTION
+        # The epoch-based scheduler defaults preserve historic constant-LR runs.
+        if key == "lr_schedule" and actual is None:
+            actual = DEFAULT_LR_SCHEDULE
+        if key == "warmup_epochs" and actual is None:
+            actual = DEFAULT_WARMUP_EPOCHS
+        if key == "warmup_start_factor" and actual is None:
+            actual = DEFAULT_WARMUP_START_FACTOR
+        if key == "cosine_final_factor" and actual is None:
+            actual = DEFAULT_COSINE_FINAL_FACTOR
         if not values_match(expected, actual):
             mismatches.append(f"{key}: expected {expected!r}, found {actual!r}")
 
@@ -280,6 +308,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balanced-sampling", action="store_true")
     parser.add_argument("--balanced-sampling-power", type=float, default=1.0)
     add_plateau_early_stopping_arguments(parser)
+    add_epoch_lr_schedule_arguments(parser)
     add_checkpoint_selection_argument(parser)
     parser.add_argument(
         "--force",
@@ -301,7 +330,9 @@ def main() -> None:
         raise ValueError("--reg-max must be positive")
     if args.workers < 0 or not 0.0 < args.fraction <= 1.0:
         raise ValueError("--workers must be non-negative and --fraction must be in (0, 1]")
-    plateau_early_stopping_config_from_args(args)
+    plateau_config = plateau_early_stopping_config_from_args(args)
+    epoch_schedule_config = epoch_lr_schedule_config_from_args(args)
+    validate_training_control_compatibility(plateau_config, epoch_schedule_config)
     validate_checkpoint_selection(args.checkpoint_selection)
     if not args.data_root.is_dir():
         raise FileNotFoundError(f"Data root does not exist: {args.data_root}")

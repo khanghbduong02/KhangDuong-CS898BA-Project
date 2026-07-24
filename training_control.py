@@ -25,6 +25,123 @@ DEFAULT_EARLY_STOPPING_PATIENCE = 18
 DEFAULT_EARLY_STOPPING_MIN_DELTA = 0.0
 DEFAULT_CHECKPOINT_SELECTION = "val_loss"
 CHECKPOINT_SELECTION_CHOICES = ("val_loss", "map50")
+DEFAULT_LR_SCHEDULE = "constant"
+LR_SCHEDULE_CHOICES = ("constant", "cosine")
+DEFAULT_WARMUP_EPOCHS = 0
+DEFAULT_WARMUP_START_FACTOR = 0.1
+DEFAULT_COSINE_FINAL_FACTOR = 0.02
+
+
+@dataclass(frozen=True)
+class EpochLRScheduleConfig:
+    """Configuration for a deterministic epoch-based learning-rate schedule.
+
+    The default preserves the historical constant learning rate exactly. The
+    cosine option is intentionally independent of validation loss so a
+    schedule-only experiment does not use the validation fold to alter its
+    optimization trajectory.
+    """
+
+    total_epochs: int
+    schedule: str = DEFAULT_LR_SCHEDULE
+    warmup_epochs: int = DEFAULT_WARMUP_EPOCHS
+    warmup_start_factor: float = DEFAULT_WARMUP_START_FACTOR
+    cosine_final_factor: float = DEFAULT_COSINE_FINAL_FACTOR
+
+    @property
+    def enabled(self) -> bool:
+        return self.schedule != "constant" or self.warmup_epochs > 0
+
+    def validate(self) -> None:
+        if self.total_epochs <= 0:
+            raise ValueError("--epochs must be positive for the learning-rate schedule")
+        if self.schedule not in LR_SCHEDULE_CHOICES:
+            raise ValueError(f"--lr-schedule must be one of {LR_SCHEDULE_CHOICES}")
+        if self.warmup_epochs < 0:
+            raise ValueError("--warmup-epochs must be non-negative")
+        if self.warmup_epochs > self.total_epochs:
+            raise ValueError("--warmup-epochs cannot exceed --epochs")
+        if not 0.0 < self.warmup_start_factor <= 1.0:
+            raise ValueError("--warmup-start-factor must be in (0, 1]")
+        if not 0.0 < self.cosine_final_factor <= 1.0:
+            raise ValueError("--cosine-final-factor must be in (0, 1]")
+        if self.schedule == "cosine" and self.warmup_epochs >= self.total_epochs:
+            raise ValueError("--lr-schedule cosine requires at least one epoch after warmup")
+
+
+@dataclass(frozen=True)
+class EpochLRScheduleStep:
+    """Observable learning-rate state applied before one training epoch."""
+
+    epoch: int
+    factor: float
+    learning_rates: tuple[float, ...]
+
+
+class EpochLRScheduler:
+    """Apply optional linear warmup followed by a deterministic cosine decay."""
+
+    def __init__(self, optimizer: Optimizer, config: EpochLRScheduleConfig) -> None:
+        config.validate()
+        self.optimizer = optimizer
+        self.config = config
+        self.base_learning_rates = tuple(float(group["lr"]) for group in optimizer.param_groups)
+        if not self.base_learning_rates or any(
+            not math.isfinite(rate) or rate <= 0.0 for rate in self.base_learning_rates
+        ):
+            raise ValueError("Optimizer learning rates must be finite and positive")
+        self.last_epoch = 0
+        self.last_factor = 1.0
+
+    def factor_for_epoch(self, epoch: int) -> float:
+        """Return the multiplier for one-indexed ``epoch`` without mutating state."""
+        if not 1 <= epoch <= self.config.total_epochs:
+            raise ValueError(
+                f"Learning-rate schedule epoch must be in [1, {self.config.total_epochs}], got {epoch}"
+            )
+
+        if self.config.warmup_epochs > 0 and epoch <= self.config.warmup_epochs:
+            if self.config.warmup_epochs == 1:
+                return 1.0
+            progress = (epoch - 1) / (self.config.warmup_epochs - 1)
+            return self.config.warmup_start_factor + (
+                1.0 - self.config.warmup_start_factor
+            ) * progress
+
+        if self.config.schedule == "constant":
+            return 1.0
+
+        decay_epochs = self.config.total_epochs - self.config.warmup_epochs
+        if decay_epochs <= 1:
+            return self.config.cosine_final_factor
+        progress = (epoch - self.config.warmup_epochs - 1) / (decay_epochs - 1)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.config.cosine_final_factor + (
+            1.0 - self.config.cosine_final_factor
+        ) * cosine
+
+    def set_epoch(self, epoch: int) -> EpochLRScheduleStep:
+        """Set all optimizer groups to the scheduled rate for one training epoch."""
+        factor = self.factor_for_epoch(epoch)
+        for group, base_rate in zip(self.optimizer.param_groups, self.base_learning_rates):
+            group["lr"] = base_rate * factor
+        self.last_epoch = epoch
+        self.last_factor = factor
+        return EpochLRScheduleStep(
+            epoch=epoch,
+            factor=factor,
+            learning_rates=tuple(float(group["lr"]) for group in self.optimizer.param_groups),
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return serializable schedule metadata for transparent checkpoints."""
+        return {
+            "config": asdict(self.config),
+            "base_learning_rates": list(self.base_learning_rates),
+            "last_epoch": self.last_epoch,
+            "last_factor": self.last_factor,
+            "learning_rates": [float(group["lr"]) for group in self.optimizer.param_groups],
+        }
 
 
 @dataclass(frozen=True)
@@ -132,6 +249,37 @@ def add_plateau_early_stopping_arguments(parser: argparse.ArgumentParser) -> Non
     )
 
 
+def add_epoch_lr_schedule_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add optional deterministic warmup/cosine learning-rate arguments."""
+    parser.add_argument(
+        "--lr-schedule",
+        choices=LR_SCHEDULE_CHOICES,
+        default=DEFAULT_LR_SCHEDULE,
+        help=(
+            "Epoch-based learning-rate schedule; constant preserves historical behavior, while cosine "
+            "uses deterministic decay after optional warmup"
+        ),
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=DEFAULT_WARMUP_EPOCHS,
+        help="Linear learning-rate warmup epochs; 0 disables warmup",
+    )
+    parser.add_argument(
+        "--warmup-start-factor",
+        type=float,
+        default=DEFAULT_WARMUP_START_FACTOR,
+        help="Learning-rate multiplier at the first warmup epoch",
+    )
+    parser.add_argument(
+        "--cosine-final-factor",
+        type=float,
+        default=DEFAULT_COSINE_FINAL_FACTOR,
+        help="Final learning-rate multiplier at the last cosine-decay epoch",
+    )
+
+
 def add_checkpoint_selection_argument(parser: argparse.ArgumentParser) -> None:
     """Add a reproducible criterion for choosing ``best.pt``.
 
@@ -188,6 +336,33 @@ def plateau_early_stopping_config_from_args(args: argparse.Namespace) -> Plateau
     )
     config.validate()
     return config
+
+
+def epoch_lr_schedule_config_from_args(args: argparse.Namespace) -> EpochLRScheduleConfig:
+    """Build and validate an epoch-based schedule configuration from trainer arguments."""
+    config = EpochLRScheduleConfig(
+        total_epochs=args.epochs,
+        schedule=args.lr_schedule,
+        warmup_epochs=args.warmup_epochs,
+        warmup_start_factor=args.warmup_start_factor,
+        cosine_final_factor=args.cosine_final_factor,
+    )
+    config.validate()
+    return config
+
+
+def validate_training_control_compatibility(
+    plateau_config: PlateauEarlyStoppingConfig,
+    epoch_schedule_config: EpochLRScheduleConfig,
+) -> None:
+    """Reject ambiguous combinations of validation-driven and epoch-driven schedulers."""
+    plateau_config.validate()
+    epoch_schedule_config.validate()
+    if plateau_config.enabled and epoch_schedule_config.enabled:
+        raise ValueError(
+            "An epoch-based learning-rate schedule requires --reduce-lr-patience 0 and "
+            "--early-stopping-patience 0 so it is not mixed with validation-loss plateau control"
+        )
 
 
 @dataclass(frozen=True)
