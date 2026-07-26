@@ -19,6 +19,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
+from model_ema import DEFAULT_EMA_DECAY, ModelEMA, validate_ema_decay
 from models.faster_rcnn import build_faster_rcnn
 from training_control import (
     EpochLRScheduler,
@@ -275,6 +276,7 @@ def run_epoch(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     use_amp: bool,
+    ema: ModelEMA | None = None,
 ) -> Tuple[float, float, float]:
     """Run one training or validation epoch.
 
@@ -319,6 +321,8 @@ def run_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 scaler.step(optimizer)  # type: ignore[arg-type]
                 scaler.update()
+                if ema is not None:
+                    ema.update(model)
 
         total += float(losses.detach().item())
         cls += _get_loss(loss_dict, "loss_classifier")
@@ -486,6 +490,15 @@ def parse_args() -> argparse.Namespace:
         "--save-dir", type=Path, default=Path("runs/faster_rcnn"),
         help="Output directory for best.pt and last.pt checkpoints.",
     )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=DEFAULT_EMA_DECAY,
+        help=(
+            "Per-epoch EMA retention factor for model weights and floating buffers; 0 disables EMA. "
+            "A non-zero EMA requires --checkpoint-selection map50."
+        ),
+    )
     add_plateau_early_stopping_arguments(parser)
     add_epoch_lr_schedule_arguments(parser)
     add_checkpoint_selection_argument(parser)
@@ -516,10 +529,13 @@ def main() -> None:
         raise ValueError("--backbone-lr-multiplier must be in (0, 1]")
     if args.backbone_weights == "imagenet" and args.scale not in {"s", "m"}:
         raise ValueError("--backbone-weights imagenet supports only --scale s or m")
+    args.ema_decay = validate_ema_decay(args.ema_decay)
     training_control_config = plateau_early_stopping_config_from_args(args)
     epoch_lr_schedule_config = epoch_lr_schedule_config_from_args(args)
     validate_training_control_compatibility(training_control_config, epoch_lr_schedule_config)
     checkpoint_selection = validate_checkpoint_selection(args.checkpoint_selection)
+    if args.ema_decay > 0.0 and checkpoint_selection != "map50":
+        raise ValueError("--ema-decay requires --checkpoint-selection map50")
 
     device = torch.device(args.device)
     args.data_root = args.data_root.resolve()
@@ -605,6 +621,11 @@ def main() -> None:
         backbone_lr_multiplier=args.backbone_lr_multiplier,
     )
     training_control = PlateauEarlyStopping(optimizer, training_control_config)
+    ema = (
+        ModelEMA(model, decay=args.ema_decay, updates_per_epoch=len(train_loader))
+        if args.ema_decay > 0.0
+        else None
+    )
     epoch_lr_scheduler = (
         EpochLRScheduler(optimizer, epoch_lr_schedule_config)
         if epoch_lr_schedule_config.enabled
@@ -656,6 +677,13 @@ def main() -> None:
             f"warmup_start_factor={epoch_lr_schedule_config.warmup_start_factor:g} "
             f"cosine_final_factor={epoch_lr_schedule_config.cosine_final_factor:g}"
         )
+    if ema is None:
+        print("Model EMA: disabled")
+    else:
+        print(
+            f"Model EMA: decay_per_epoch={ema.decay:g} updates_per_epoch={ema.updates_per_epoch} "
+            f"per_update_decay={ema.per_update_decay:.8f}; mAP50 selection uses EMA weights"
+        )
     if sampler_counts is not None:
         count_summary = ", ".join(
             f"class_{class_id}:{count}" for class_id, count in enumerate(sampler_counts)
@@ -681,7 +709,7 @@ def main() -> None:
             epoch_lr_scheduler.set_epoch(epoch) if epoch_lr_scheduler is not None else None
         )
         train_loss, train_cls, train_box = run_epoch(
-            model, train_loader, optimizer, scaler, device, use_amp=use_amp,
+            model, train_loader, optimizer, scaler, device, use_amp=use_amp, ema=ema,
         )
         val_loss, val_cls, val_box = run_epoch(
             model, valid_loader, optimizer=None, scaler=scaler, device=device, use_amp=use_amp,
@@ -689,13 +717,23 @@ def main() -> None:
 
         selection_metrics: dict[str, Any] | None = None
         if checkpoint_selection == "map50":
-            selection_metrics = validation_detection_metrics(
-                model=model,
-                loader=valid_loader,
-                device=device,
-                num_classes=num_classes,
-                use_amp=use_amp,
-            )
+            if ema is None:
+                selection_metrics = validation_detection_metrics(
+                    model=model,
+                    loader=valid_loader,
+                    device=device,
+                    num_classes=num_classes,
+                    use_amp=use_amp,
+                )
+            else:
+                with ema.average_parameters(model):
+                    selection_metrics = validation_detection_metrics(
+                        model=model,
+                        loader=valid_loader,
+                        device=device,
+                        num_classes=num_classes,
+                        use_amp=use_amp,
+                    )
             selection_value = float(selection_metrics["map50"])
         else:
             selection_value = val_loss
@@ -720,7 +758,7 @@ def main() -> None:
         )
 
         checkpoint: Dict[str, Any] = {
-            "format_version": 4,
+            "format_version": 5,
             "model_name": "custom_faster_rcnn",
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -744,6 +782,9 @@ def main() -> None:
             "validation_map50_95": (
                 float(selection_metrics["map50_95"]) if selection_metrics is not None else None
             ),
+            "checkpoint_weight_source": "raw",
+            "checkpoint_selection_weight_source": "ema" if ema is not None else "raw",
+            "ema_metadata": ema.metadata() if ema is not None else None,
             "training_control": training_control.state_dict(),
             "epoch_lr_schedule": (
                 epoch_lr_scheduler.state_dict() if epoch_lr_scheduler is not None else None
@@ -754,7 +795,13 @@ def main() -> None:
         }
         torch.save(checkpoint, last_path)
         if is_best:
-            torch.save(checkpoint, best_path)
+            if ema is None:
+                torch.save(checkpoint, best_path)
+            else:
+                best_checkpoint = dict(checkpoint)
+                best_checkpoint["model_state_dict"] = ema.model_state_dict()
+                best_checkpoint["checkpoint_weight_source"] = "ema"
+                torch.save(best_checkpoint, best_path)
 
         history_record = {
             "epoch": epoch,
@@ -778,6 +825,8 @@ def main() -> None:
             "lr_schedule_factor": (
                 epoch_schedule_step.factor if epoch_schedule_step is not None else 1.0
             ),
+            "checkpoint_selection_weight_source": "ema" if ema is not None else "raw",
+            "ema_metadata": ema.metadata() if ema is not None else None,
             "lr_reduced": control_step.lr_reduced,
             "early_stopping_bad_epochs": control_step.bad_epochs,
             "training_completed": training_completed,
@@ -793,6 +842,11 @@ def main() -> None:
             if epoch_schedule_step is not None
             else ""
         )
+        ema_text = (
+            f" ema_updates={ema.updates} selection_weights=ema"
+            if ema is not None
+            else " selection_weights=raw"
+        )
         selection_text = (
             f" val_map50={float(selection_metrics['map50']):.4f}"
             if selection_metrics is not None
@@ -803,7 +857,7 @@ def main() -> None:
             f"train_loss={train_loss:.4f} train_cls={train_cls:.4f} train_box={train_box:.4f} "
             f"val_loss={val_loss:.4f} val_cls={val_cls:.4f} val_box={val_box:.4f} "
             f"lr={lr_text} checkpoint_selection={checkpoint_selection}:{selection_value:.4f}"
-            f"{selection_text} early_stop_bad_epochs={control_step.bad_epochs}{reduction_text}{schedule_text}"
+            f"{selection_text} early_stop_bad_epochs={control_step.bad_epochs}{reduction_text}{schedule_text}{ema_text}"
         )
         if control_step.should_stop:
             print(

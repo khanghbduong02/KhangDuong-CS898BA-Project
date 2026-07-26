@@ -201,6 +201,9 @@ def main() -> None:
         reg_max,
         use_p2,
     ) = _resolve_evaluation_settings(checkpoint, args)
+    checkpoint_weight_source = str(checkpoint.get("checkpoint_weight_source", "raw"))
+    if checkpoint_weight_source not in {"raw", "ema"}:
+        raise ValueError(f"Unsupported checkpoint weight source: {checkpoint_weight_source!r}")
     if reg_max <= 0:
         raise ValueError("Resolved reg_max must be positive")
     class_positive_weights = _load_positive_class_weights(checkpoint, num_classes, device)
@@ -247,7 +250,7 @@ def main() -> None:
         f"positive_class_weights=({class_weight_summary}) postprocess={args.postprocess} "
         f"inference_branch={args.inference_branch} "
         f"nms_iou={args.nms_iou:g} nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det} "
-        f"tta_hflip={args.tta_hflip}"
+        f"tta_hflip={args.tta_hflip} checkpoint_weights={checkpoint_weight_source}"
     )
     model.eval()
     total_loss = 0.0
@@ -328,6 +331,7 @@ def main() -> None:
         metrics_output = {
             "checkpoint": str(args.checkpoint),
             "checkpoint_epoch": int(checkpoint.get("epoch", 0)),
+            "checkpoint_weight_source": checkpoint_weight_source,
             "data_root": str(args.data_root),
             "split": args.split,
             "image_count": len(dataset),
@@ -354,6 +358,7 @@ def main() -> None:
                 "nms_score_threshold": args.nms_score_thresh,
                 "max_detections": args.max_det,
                 "tta_hflip": args.tta_hflip,
+                "ema_metadata": checkpoint.get("ema_metadata"),
             },
             "metrics": metrics,
         }

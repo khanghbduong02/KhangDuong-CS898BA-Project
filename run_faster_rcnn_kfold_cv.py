@@ -13,6 +13,7 @@ from typing import Any
 import torch
 
 from cv_utils import PROJECT_ROOT, discover_folds, project_path, render_fold_path, validate_cv_layout
+from model_ema import DEFAULT_EMA_DECAY, validate_ema_decay
 from training_control import (
     DEFAULT_CHECKPOINT_SELECTION,
     DEFAULT_COSINE_FINAL_FACTOR,
@@ -60,6 +61,7 @@ def training_settings(args: argparse.Namespace, num_classes: int) -> dict[str, A
         "warmup_epochs": args.warmup_epochs,
         "warmup_start_factor": args.warmup_start_factor,
         "cosine_final_factor": args.cosine_final_factor,
+        "ema_decay": args.ema_decay,
         "checkpoint_selection": args.checkpoint_selection,
     }
 
@@ -125,6 +127,8 @@ def build_train_command(
         str(args.warmup_start_factor),
         "--cosine-final-factor",
         str(args.cosine_final_factor),
+        "--ema-decay",
+        str(args.ema_decay),
         "--checkpoint-selection",
         args.checkpoint_selection,
         "--save-dir",
@@ -190,6 +194,8 @@ def completed_run_matches(
             actual = DEFAULT_WARMUP_START_FACTOR
         if key == "cosine_final_factor" and actual is None:
             actual = DEFAULT_COSINE_FINAL_FACTOR
+        if key == "ema_decay" and actual is None:
+            actual = DEFAULT_EMA_DECAY
         if not values_match(expected, actual):
             mismatches.append(f"{key}: expected {expected!r}, found {actual!r}")
 
@@ -288,6 +294,12 @@ def parse_args() -> argparse.Namespace:
     add_epoch_lr_schedule_arguments(parser)
     add_checkpoint_selection_argument(parser)
     parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=DEFAULT_EMA_DECAY,
+        help="Per-epoch EMA retention factor; 0 disables EMA",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Delete and retrain an existing selected fold even if it is completed or partial",
@@ -318,7 +330,10 @@ def main() -> None:
     plateau_config = plateau_early_stopping_config_from_args(args)
     epoch_schedule_config = epoch_lr_schedule_config_from_args(args)
     validate_training_control_compatibility(plateau_config, epoch_schedule_config)
-    validate_checkpoint_selection(args.checkpoint_selection)
+    checkpoint_selection = validate_checkpoint_selection(args.checkpoint_selection)
+    args.ema_decay = validate_ema_decay(args.ema_decay)
+    if args.ema_decay > 0.0 and checkpoint_selection != "map50":
+        raise ValueError("--ema-decay requires --checkpoint-selection map50")
     if not args.data_root.is_dir():
         raise FileNotFoundError(f"Data root does not exist: {args.data_root}")
 
