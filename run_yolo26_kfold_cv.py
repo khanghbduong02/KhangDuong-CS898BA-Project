@@ -14,6 +14,11 @@ import torch
 
 from cv_utils import PROJECT_ROOT, discover_folds, project_path, render_fold_path, validate_cv_layout
 from model_ema import DEFAULT_EMA_DECAY, validate_ema_decay
+from online_augmentation import (
+    DEFAULT_ONLINE_AUGMENTATION,
+    ONLINE_AUGMENTATION_CHOICES,
+    validate_online_augmentation,
+)
 from training_control import (
     DEFAULT_CHECKPOINT_SELECTION,
     DEFAULT_COSINE_FINAL_FACTOR,
@@ -56,6 +61,7 @@ def training_settings(args: argparse.Namespace, num_classes: int) -> dict[str, A
         "class_positive_weight_power": args.class_positive_weight_power,
         "balanced_sampling": args.balanced_sampling,
         "balanced_sampling_power": args.balanced_sampling_power,
+        "online_augmentation": args.online_augmentation,
         "reduce_lr_patience": args.reduce_lr_patience,
         "reduce_lr_factor": args.reduce_lr_factor,
         "reduce_lr_cooldown": args.reduce_lr_cooldown,
@@ -122,6 +128,8 @@ def build_train_command(
         str(args.class_positive_weight_power),
         "--balanced-sampling-power",
         str(args.balanced_sampling_power),
+        "--online-augmentation",
+        args.online_augmentation,
         "--reduce-lr-patience",
         str(args.reduce_lr_patience),
         "--reduce-lr-factor",
@@ -212,6 +220,8 @@ def completed_run_matches(
             actual = DEFAULT_WARMUP_START_FACTOR
         if key == "cosine_final_factor" and actual is None:
             actual = DEFAULT_COSINE_FINAL_FACTOR
+        if key == "online_augmentation" and actual is None:
+            actual = DEFAULT_ONLINE_AUGMENTATION
         if key == "ema_decay" and actual is None:
             actual = DEFAULT_EMA_DECAY
         if not values_match(expected, actual):
@@ -313,6 +323,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--class-positive-weight-power", type=float, default=0.0)
     parser.add_argument("--balanced-sampling", action="store_true")
     parser.add_argument("--balanced-sampling-power", type=float, default=1.0)
+    parser.add_argument(
+        "--online-augmentation",
+        choices=ONLINE_AUGMENTATION_CHOICES,
+        default=DEFAULT_ONLINE_AUGMENTATION,
+        help="Training-only in-memory augmentation policy passed to every fold",
+    )
     add_plateau_early_stopping_arguments(parser)
     add_epoch_lr_schedule_arguments(parser)
     add_checkpoint_selection_argument(parser)
@@ -346,6 +362,7 @@ def main() -> None:
     epoch_schedule_config = epoch_lr_schedule_config_from_args(args)
     validate_training_control_compatibility(plateau_config, epoch_schedule_config)
     checkpoint_selection = validate_checkpoint_selection(args.checkpoint_selection)
+    args.online_augmentation = validate_online_augmentation(args.online_augmentation)
     args.ema_decay = validate_ema_decay(args.ema_decay)
     if args.ema_decay > 0.0 and checkpoint_selection != "map50":
         raise ValueError("--ema-decay requires --checkpoint-selection map50")

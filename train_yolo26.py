@@ -19,6 +19,12 @@ from ultralytics.utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors
 from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
 from model_ema import DEFAULT_EMA_DECAY, ModelEMA, validate_ema_decay
 from models.yolo26_torch import build_yolo26, class_aware_nms
+from online_augmentation import (
+    DEFAULT_ONLINE_AUGMENTATION,
+    ONLINE_AUGMENTATION_CHOICES,
+    apply_online_augmentation,
+    validate_online_augmentation,
+)
 from training_control import (
     EpochLRScheduler,
     PlateauEarlyStopping,
@@ -65,10 +71,17 @@ def focal_bce_with_logits(
 
 
 class YoloDetectionDataset(Dataset):
-    def __init__(self, split_root: Path, imgsz: int, fraction: float = 1.0) -> None:
+    def __init__(
+        self,
+        split_root: Path,
+        imgsz: int,
+        fraction: float = 1.0,
+        online_augmentation: str = DEFAULT_ONLINE_AUGMENTATION,
+    ) -> None:
         self.images_dir = split_root / "images"
         self.labels_dir = split_root / "labels"
         self.imgsz = imgsz
+        self.online_augmentation = validate_online_augmentation(online_augmentation)
 
         image_paths = [
             path
@@ -103,6 +116,7 @@ class YoloDetectionDataset(Dataset):
 
         image = cv2.resize(image, (target_w, target_h), interpolation=interpolation)
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+        image_tensor = apply_online_augmentation(image_tensor, self.online_augmentation)
 
         label_path = self.labels_dir / f"{image_path.stem}.txt"
         labels = []
@@ -703,6 +717,15 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Sampling strength from 0.0 (uniform) to 1.0 (full inverse-frequency weighting)",
     )
+    parser.add_argument(
+        "--online-augmentation",
+        choices=ONLINE_AUGMENTATION_CHOICES,
+        default=DEFAULT_ONLINE_AUGMENTATION,
+        help=(
+            "Training-only image augmentation; photometric applies conservative brightness, contrast, gamma, "
+            "and noise changes without changing boxes, labels, or source files"
+        ),
+    )
     parser.add_argument("--device", type=str, default="cuda", help="Training device, e.g. cuda or cuda:0")
     parser.add_argument("--scale", type=str, default="n", help="YOLO26 scale variant")
     parser.add_argument(
@@ -770,6 +793,7 @@ def main() -> None:
         raise ValueError("--num-classes must be positive")
     if args.reg_max <= 0:
         raise ValueError("--reg-max must be positive")
+    args.online_augmentation = validate_online_augmentation(args.online_augmentation)
     args.ema_decay = validate_ema_decay(args.ema_decay)
     training_control_config = plateau_early_stopping_config_from_args(args)
     epoch_lr_schedule_config = epoch_lr_schedule_config_from_args(args)
@@ -778,7 +802,12 @@ def main() -> None:
     if args.ema_decay > 0.0 and checkpoint_selection != "map50":
         raise ValueError("--ema-decay requires --checkpoint-selection map50")
 
-    train_dataset = YoloDetectionDataset(train_root, imgsz=args.imgsz, fraction=args.fraction)
+    train_dataset = YoloDetectionDataset(
+        train_root,
+        imgsz=args.imgsz,
+        fraction=args.fraction,
+        online_augmentation=args.online_augmentation,
+    )
     valid_dataset = YoloDetectionDataset(valid_root, imgsz=args.imgsz, fraction=args.fraction)
     class_positive_weights, class_box_counts = build_positive_class_weights(
         train_dataset,
@@ -873,6 +902,10 @@ def main() -> None:
     print(f"Classification focal gamma={args.focal_gamma:g}")
     print(f"Box regression: reg_max={args.reg_max} ({'DFL' if args.reg_max > 1 else 'direct distances'})")
     print(f"Detection feature strides={model_strides} use_p2={args.use_p2}")
+    print(
+        f"Online training augmentation: {args.online_augmentation} "
+        "(validation images, labels, and source files unchanged)"
+    )
     if training_control_config.enabled:
         print(
             "Training control: ReduceLROnPlateau "

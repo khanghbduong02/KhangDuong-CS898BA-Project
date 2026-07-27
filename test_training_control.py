@@ -209,6 +209,7 @@ def test_kfold_runners_accept_early_stopped_checkpoints() -> None:
                     "warmup_epochs": 0,
                     "warmup_start_factor": 0.1,
                     "cosine_final_factor": 0.02,
+                    "online_augmentation": "none",
                     "ema_decay": 0.0,
                 },
                 ("defect",),

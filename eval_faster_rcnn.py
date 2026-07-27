@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from detection_metrics import compute_detection_metrics
 from inference_tta import merge_hflip_predictions
 from models.faster_rcnn import build_faster_rcnn
+from online_augmentation import DEFAULT_ONLINE_AUGMENTATION, validate_online_augmentation
 from train_faster_rcnn import FasterRCNNDataset, collate_fn
 from yolo_dataset_config import read_yolo_dataset_config
 
@@ -226,6 +227,9 @@ def main() -> None:
     saved_args = checkpoint.get("args", {})
     if not isinstance(saved_args, dict):
         saved_args = {}
+    training_online_augmentation = validate_online_augmentation(
+        str(saved_args.get("online_augmentation", DEFAULT_ONLINE_AUGMENTATION))
+    )
     backbone_weights = str(saved_args.get("backbone_weights", "none"))
     backbone_lr_multiplier = float(saved_args.get("backbone_lr_multiplier", 1.0))
     backbone_initialization = str(checkpoint.get("backbone_initialization", "random"))
@@ -334,6 +338,7 @@ def main() -> None:
                 "max_det": args.max_det,
                 "tta_hflip": args.tta_hflip,
                 "ema_metadata": checkpoint.get("ema_metadata"),
+                "training_online_augmentation": training_online_augmentation,
             },
             "metrics": metrics,
         }
@@ -345,7 +350,8 @@ def main() -> None:
         f"backbone_weights={backbone_weights} backbone_initialization={backbone_initialization} "
         f"postprocess=per_class_nms nms_iou={args.nms_iou:g} "
         f"nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det} tta_hflip={args.tta_hflip} "
-        f"checkpoint_weights={checkpoint_weight_source}"
+        f"checkpoint_weights={checkpoint_weight_source} "
+        f"training_online_augmentation={training_online_augmentation}"
     )
     print(
         f"model=faster_rcnn (scale={scale}) split={args.split} images={len(dataset)} "

@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
 from inference_tta import horizontal_flip_images, unflip_decoded_xyxy
 from models.yolo26_torch import build_yolo26, class_aware_nms
+from online_augmentation import DEFAULT_ONLINE_AUGMENTATION, validate_online_augmentation
 from train_yolo26 import E2EDetectLoss, YoloDetectionDataset, collate_fn, compute_loss
 from yolo_dataset_config import read_yolo_dataset_config
 
@@ -204,6 +205,12 @@ def main() -> None:
     checkpoint_weight_source = str(checkpoint.get("checkpoint_weight_source", "raw"))
     if checkpoint_weight_source not in {"raw", "ema"}:
         raise ValueError(f"Unsupported checkpoint weight source: {checkpoint_weight_source!r}")
+    saved_training_args = checkpoint.get("args", {})
+    if not isinstance(saved_training_args, dict):
+        saved_training_args = {}
+    training_online_augmentation = validate_online_augmentation(
+        str(saved_training_args.get("online_augmentation", DEFAULT_ONLINE_AUGMENTATION))
+    )
     if reg_max <= 0:
         raise ValueError("Resolved reg_max must be positive")
     class_positive_weights = _load_positive_class_weights(checkpoint, num_classes, device)
@@ -250,7 +257,8 @@ def main() -> None:
         f"positive_class_weights=({class_weight_summary}) postprocess={args.postprocess} "
         f"inference_branch={args.inference_branch} "
         f"nms_iou={args.nms_iou:g} nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det} "
-        f"tta_hflip={args.tta_hflip} checkpoint_weights={checkpoint_weight_source}"
+        f"tta_hflip={args.tta_hflip} checkpoint_weights={checkpoint_weight_source} "
+        f"training_online_augmentation={training_online_augmentation}"
     )
     model.eval()
     total_loss = 0.0
@@ -359,6 +367,7 @@ def main() -> None:
                 "max_detections": args.max_det,
                 "tta_hflip": args.tta_hflip,
                 "ema_metadata": checkpoint.get("ema_metadata"),
+                "training_online_augmentation": training_online_augmentation,
             },
             "metrics": metrics,
         }

@@ -21,6 +21,12 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
 from model_ema import DEFAULT_EMA_DECAY, ModelEMA, validate_ema_decay
 from models.faster_rcnn import build_faster_rcnn
+from online_augmentation import (
+    DEFAULT_ONLINE_AUGMENTATION,
+    ONLINE_AUGMENTATION_CHOICES,
+    apply_online_augmentation,
+    validate_online_augmentation,
+)
 from training_control import (
     EpochLRScheduler,
     PlateauEarlyStopping,
@@ -109,7 +115,14 @@ class FasterRCNNDataset(Dataset):
                          class 0 for background internally.
     """
 
-    def __init__(self, split_root: Path, imgsz: int, num_classes: int, fraction: float = 1.0) -> None:
+    def __init__(
+        self,
+        split_root: Path,
+        imgsz: int,
+        num_classes: int,
+        fraction: float = 1.0,
+        online_augmentation: str = DEFAULT_ONLINE_AUGMENTATION,
+    ) -> None:
         if imgsz <= 0:
             raise ValueError("imgsz must be positive")
         if num_classes <= 0:
@@ -121,6 +134,7 @@ class FasterRCNNDataset(Dataset):
         self.labels_dir = split_root / "labels"
         self.imgsz = imgsz
         self.num_classes = num_classes
+        self.online_augmentation = validate_online_augmentation(online_augmentation)
         if not self.images_dir.is_dir() or not self.labels_dir.is_dir():
             raise FileNotFoundError(
                 f"Expected images/ and labels/ directories under split root {split_root}"
@@ -155,6 +169,7 @@ class FasterRCNNDataset(Dataset):
 
         image = cv2.resize(image, (self.imgsz, self.imgsz), interpolation=interp)
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+        image_tensor = apply_online_augmentation(image_tensor, self.online_augmentation)
 
         label_path = self.labels_dir / f"{image_path.stem}.txt"
         raw = read_yolo_label(label_path, self.num_classes)
@@ -460,6 +475,15 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Sampling strength from 0.0 (uniform) to 1.0 (full inverse-frequency weighting)",
     )
+    parser.add_argument(
+        "--online-augmentation",
+        choices=ONLINE_AUGMENTATION_CHOICES,
+        default=DEFAULT_ONLINE_AUGMENTATION,
+        help=(
+            "Training-only image augmentation; photometric applies conservative brightness, contrast, gamma, "
+            "and noise changes without changing boxes, labels, or source files"
+        ),
+    )
     parser.add_argument("--device", type=str, default="cuda",
                         help="Training device, e.g. 'cuda' or 'cpu'.")
     parser.add_argument(
@@ -529,6 +553,7 @@ def main() -> None:
         raise ValueError("--backbone-lr-multiplier must be in (0, 1]")
     if args.backbone_weights == "imagenet" and args.scale not in {"s", "m"}:
         raise ValueError("--backbone-weights imagenet supports only --scale s or m")
+    args.online_augmentation = validate_online_augmentation(args.online_augmentation)
     args.ema_decay = validate_ema_decay(args.ema_decay)
     training_control_config = plateau_early_stopping_config_from_args(args)
     epoch_lr_schedule_config = epoch_lr_schedule_config_from_args(args)
@@ -568,6 +593,7 @@ def main() -> None:
         imgsz=args.imgsz,
         num_classes=num_classes,
         fraction=args.fraction,
+        online_augmentation=args.online_augmentation,
     )
     valid_dataset = FasterRCNNDataset(
         valid_root,
@@ -655,6 +681,10 @@ def main() -> None:
     print(
         f"Positive class weighting: power={args.class_positive_weight_power:.2f} "
         f"box_counts=({class_count_summary}) weights=({class_weight_summary})"
+    )
+    print(
+        f"Online training augmentation: {args.online_augmentation} "
+        "(validation images, labels, and source files unchanged)"
     )
     if training_control_config.enabled:
         print(
