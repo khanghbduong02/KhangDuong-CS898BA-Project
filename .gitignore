@@ -1,3 +1,4 @@
+# Downloaded, processed, and generated experiment data
 roboflow-data/
 processed-data/
 candidate-data/
@@ -8,8 +9,19 @@ demo-output/
 processed-data-aug20/
 processed-data-aug20-exact/
 review-data/
-__pycache__/
 runs/
+
+# Learned weights, raw archives, and rendered recordings
+*.pt
 *.zip
 *.mp4
-*.pt
+
+# Local full-media presentation backup; the repository keeps a lightweight PPTX preview
+docs/presentations/local/
+
+# Local Python and editor state
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/

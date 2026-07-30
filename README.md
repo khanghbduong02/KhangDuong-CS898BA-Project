@@ -21,6 +21,24 @@ The repository contains a working proof of concept:
 
 An annotation-format audit found a critical dataset issue described below. The preprocessing pipeline now normalizes raw polygon annotations to enclosing YOLO bounding boxes. A later exact-image audit also found duplicate content and annotation disagreements across the exported splits. All currently reported split metrics are therefore **preliminary diagnostic results**, not leakage-free generalization estimates. The audit, controlled experiments, and required group-disjoint cross-validation protocol are recorded in [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md).
 
+## Repository Structure
+
+The executable Python modules remain at the repository root so direct commands and the K-fold runners keep their stable top-level imports and script paths.
+
+| Location | Purpose |
+| --- | --- |
+| [README.md](README.md) | Project overview, environment setup, reproducible commands, and reported results. |
+| [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md) | Detailed experimental decisions, metrics, validation evidence, and protocol limits. |
+| [AI_Log.md](AI_Log.md) | AI-assistance accountability record. |
+| Root `train_*.py`, `eval_*.py`, `run_*.py`, `prepare_*.py`, and `demo_*.py` | Training, evaluation, K-fold orchestration, data preparation, and demonstration entry points. |
+| Root shared modules such as `detection_metrics.py`, `cv_utils.py`, and `training_control.py` | Common metrics, dataset/CV utilities, and training controls used by the executable scripts. |
+| [models/](models/) | Local custom YOLO26-style and Faster R-CNN architecture implementations. |
+| [tests/](tests/) | Regression and smoke tests. Run one from the repository root, for example `python -m tests.test_yolo26`. |
+| [docs/presentations/](docs/presentations/) | Course presentation deliverables and final speaker script. |
+| [docs/references/](docs/references/) | Source papers used by the implementation. |
+
+Downloaded datasets, processed folds, checkpoints, generated demonstrations, archives, recordings, Python caches, virtual environments, and editor settings are intentionally excluded by [.gitignore](.gitignore). They can be regenerated using the tracked preparation, training, evaluation, and demo commands without inflating Git history.
+
 ## Dataset
 
 Source: [Roboflow](https://universe.roboflow.com/purvi-rathore-5amqh/3d-print-failure-detection-efvsh)
@@ -69,7 +87,7 @@ This repository includes a local PyTorch YOLO26-style architecture based on the 
 ### Components
 
 * `models/yolo26_torch.py` defines the backbone, PAN/FPN neck, C3k2, SPPF, C2PSA attention, dual one-to-many/one-to-one detection branches, class-aware NMS, configurable direct/DFL-style box decoding, and an optional stride-4 P2 small-object head.
-* `test.py` runs a forward-pass smoke test and prints output tensor shapes.
+* [tests/test_yolo26.py](tests/test_yolo26.py) runs a forward-pass smoke test and prints output tensor shapes.
 * `train_yolo26.py` trains the model from scratch using Task-Aligned Assignment, focal/BCE classification loss, direct or distributional (DFL) box regression, AdamW, AMP, and gradient clipping.
 * `eval_yolo26.py` evaluates a saved checkpoint on validation or test data and can explicitly decode the one-to-many or historical one-to-one branch.
 * `detection_metrics.py` computes AP, mAP50, mAP50-95, precision, recall, per-class metrics, and a detection confusion matrix.
@@ -77,7 +95,7 @@ This repository includes a local PyTorch YOLO26-style architecture based on the 
 Run the architecture smoke test:
 
 ```bash
-python test.py
+python -m tests.test_yolo26
 ```
 
 Expected output shape pattern:
@@ -96,7 +114,7 @@ The alternative detector is implemented locally without a high-level torchvision
 * `train_faster_rcnn.py` is the reproducible one-fold training primitive with strict label validation, `data.yaml` metadata validation, optional foreground class weighting/sampling, AMP, gradient clipping, checkpoint metadata, and JSONL history.
 * `eval_faster_rcnn.py` restores checkpoint settings, validates the selected dataset taxonomy, applies per-class NMS, and can write project-metric JSON.
 * `run_faster_rcnn_kfold_cv.py` and `eval_faster_rcnn_kfold_cv.py` provide generic sequential grouped-CV training and aggregate evaluation for the standard `fold_<n>` layout.
-* `test_faster_rcnn.py` checks canonical FPN-level assignment, RPN multi-positive target assignment, finite loss/backpropagation, validation BatchNorm isolation, and per-class-NMS inference output.
+* [tests/test_faster_rcnn.py](tests/test_faster_rcnn.py) checks canonical FPN-level assignment, RPN multi-positive target assignment, finite loss/backpropagation, validation BatchNorm isolation, and per-class-NMS inference output.
 
 The separately labeled practical transfer-learning study initialized Faster R-CNN `s`'s local ResNet-18-compatible backbone from torchvision ImageNet weights using `--backbone-weights imagenet` and applied `--backbone-lr-multiplier 0.1` to fine-tune the imported backbone more conservatively than the random FPN/RPN/RoI heads. This changes the study from scratch learning to transfer learning; it is reported separately and is not an architecture-only comparison with the scratch detectors.
 
@@ -175,13 +193,21 @@ The project separates one-fold model logic from cross-validation orchestration:
 
 ### Batch demonstration
 
-[demo_ultralytics.py](demo_ultralytics.py) creates annotated output images and a JSON prediction summary from a frozen Ultralytics checkpoint. It is intended for the recorded final demonstration, not for cross-validation metric selection. Use a validation-image directory rather than the excluded public candidate test split:
+[demo_custom_yolo26.py](demo_custom_yolo26.py) creates annotated batch-inference images and a JSON prediction summary from the selected local custom YOLO26 checkpoint. It is intended for the recorded final demonstration, not cross-validation metric selection. It overlays white validation ground-truth boxes and colored custom-model predictions. Use grouped validation images rather than the excluded public candidate test split:
 
 ```bash
-python demo_ultralytics.py --checkpoint runs/ultralytics/candidate_cv3_yolo26n_pretrained_imgsz640_seed42_e50/fold_1/weights/best.pt --source cv-data/roboflow-3d-print-fail-v1/fold_1/valid/images --output-dir demo-output/yolo26n_fold1_valid --imgsz 640 --batch-size 8 --conf 0.25 --iou 0.70 --max-det 300 --device 0 --max-images 12
+python demo_custom_yolo26.py --checkpoint runs/yolo26/candidate_cv3_imgsz960_n_map50_selection_focal_g2_posweight_p025_seed42_e50/fold_1/best.pt --data-root cv-data/roboflow-3d-print-fail-v1/fold_1 --source cv-data/roboflow-3d-print-fail-v1/fold_1/valid/images --labels-dir cv-data/roboflow-3d-print-fail-v1/fold_1/valid/labels --output-dir demo-output/custom_yolo26_fold1_valid --imgsz 960 --batch-size 8 --conf 0.25 --nms-iou 0.70 --max-det 300 --device cuda --inference-branch one2many --max-images 8
 ```
 
-The generated annotated images can be shown in a batch-processing video. The output JSON records the checkpoint, inference settings, and each displayed detection.
+The generated annotated images can be shown in a batch-processing video. The output JSON records the selected scratch checkpoint, inference settings, displayed ground truth, and custom predictions. [demo_ultralytics.py](demo_ultralytics.py) remains available only for a separately labeled pretrained practical-reference demonstration; do not substitute it for the local scratch-model demonstration.
+
+For the final architecture-comparison slide, [demo_custom_detector_comparison.py](demo_custom_detector_comparison.py) saves one horizontal row per grouped validation image in the fixed order **Ground Truth | Custom YOLO26 | Custom Faster R-CNN**. The two model panels use only the selected local scratch checkpoints and retain their respective selected inference policies. It is a qualitative visualization, not a new metric evaluation or an independent test claim. The default directory selection is alphabetical; use `--image-selection ground_truth_coverage` for a reproducible label-only batch that first covers every available ground-truth class and does **not** inspect either model's predictions. Faster R-CNN is rendered in float32 to match [eval_faster_rcnn.py](eval_faster_rcnn.py) exactly:
+
+```bash
+python demo_custom_detector_comparison.py --yolo-checkpoint runs/yolo26/candidate_cv3_imgsz960_n_map50_selection_focal_g2_posweight_p025_seed42_e50/fold_1/best.pt --faster-rcnn-checkpoint runs/faster_rcnn/candidate_cv3_imgsz960_s_map50_cosine_w3_sf0p1_ff0p02_posweight_p025_seed42_e50/fold_1/best.pt --data-root cv-data/roboflow-3d-print-fail-v1/fold_1 --source cv-data/roboflow-3d-print-fail-v1/fold_1/valid/images --labels-dir cv-data/roboflow-3d-print-fail-v1/fold_1/valid/labels --output-dir demo-output/custom_detector_comparison_fold1_class_coverage --title "GROUPED VALIDATION FOLD 1 - QUALITATIVE COMPARISON, NOT A METRIC EVALUATION" --yolo-imgsz 960 --faster-rcnn-imgsz 960 --batch-size 2 --conf 0.25 --nms-score-thresh 0.001 --nms-iou 0.70 --max-det 300 --device cuda --yolo-inference-branch one2many --image-selection ground_truth_coverage --max-images 4
+```
+
+Each output directory also contains `comparison_predictions.json`, including the two checkpoint paths, selected epochs, settings, image-selection rule, displayed ground truth, and each model's rendered predictions. Keep both selected run folders on the same computer before running this command; neither an Ultralytics checkpoint nor another pretrained model belongs in this grid.
 
 Example custom YOLO26 K-fold invocation:
 
