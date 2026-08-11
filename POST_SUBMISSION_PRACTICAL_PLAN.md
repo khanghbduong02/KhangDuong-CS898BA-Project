@@ -13,17 +13,19 @@ Current submitted grouped-CV development baselines at 960 pixels:
 | Official pretrained Ultralytics YOLO26n reference | 0.4592 |
 | Official pretrained Ultralytics YOLO11n reference | 0.4799 |
 
-## Practical Performance Requirements
+## Requirements In Execution Order
 
 Reaching a credible Ultralytics-level practical system requires all three items below. They are separate from, and do not change, the submitted strict-scratch study.
 
-| Requirement | Why It Is Needed | Plan Phases | Status |
-| --- | --- | --- | --- |
-| 1. Detector pretraining | Large-scale detection pretraining provides transferable visual features and localization priors that the current 3D-print dataset cannot supply from scratch. | Phase 4 | Planned after the transform and augmentation foundation is validated. |
-| 2. Mature training stack | Official Ultralytics systems combine correct image geometry, strong train-only augmentation, tuned optimization, losses, normalization, and postprocessing. | Phases 1-3 | **First implementation starts here:** shared letterbox geometry, then controlled augmentation and a parity benchmark. |
-| 3. More independent, consistent data | Sparse minority examples, ambiguous boxes, and repeatedly reused folds limit both real-world generalization and trustworthy model selection. | Phase 5 | Planned before any final practical-performance claim. |
+Requirements 1 and 2 begin in parallel: data/holdout work must start immediately, while the training-stack foundation is the first code implementation. Detector pretraining follows the validated geometry and transform contract.
 
-The first engineering task is requirement 2, not because it is the largest eventual gain, but because it is the shared foundation needed to train and evaluate both custom architectures correctly before introducing pretrained weights.
+| Execution order | Requirement | Why It Is Needed | Plan Phases | Status |
+| --- | --- | --- | --- | --- |
+| 1. Start immediately | More independent, consistent data and a protected holdout | Sparse minority examples, ambiguous boxes, and repeatedly reused folds limit both real-world generalization and trustworthy model selection. | Phases 1 and 6 | Start data audit, source-group collection, and holdout design now; this runs in parallel with the first code work. |
+| 2. First code implementation | Mature training stack | Official Ultralytics systems combine correct image geometry, strong train-only augmentation, tuned optimization, losses, normalization, and postprocessing. | Phases 2-4 | Implement shared letterbox geometry first, then controlled augmentation and an Ultralytics parity benchmark. |
+| 3. After the transform foundation | Detector pretraining | Large-scale detection pretraining provides transferable visual features and localization priors that the current 3D-print dataset cannot supply from scratch. | Phase 5 | Begin only after letterbox and evaluation parity are validated; use grouped folds as development data only. |
+
+This ordering does not mean waiting for new data before improving the code. It means data credibility begins first and continues throughout the study, while letterbox geometry is the first implementation task and pretraining is the next major performance intervention.
 
 ## Rules For The New Study
 
@@ -33,7 +35,7 @@ The first engineering task is requirement 2, not because it is the largest event
 - Clearly label pretrained weights, Ultralytics components, and external data. This is transfer learning and practical engineering, not strict scratch learning.
 - Keep the original submitted checkpoints and metrics unchanged as historical baselines.
 
-## First Implementation: Shared Letterbox And Transform Foundation
+## First Code Implementation: Shared Letterbox And Transform Foundation
 
 **Implement this first.** Both custom datasets currently stretch each image directly to a square. Add a shared transform module that:
 
@@ -52,11 +54,12 @@ Why first: it removes avoidable geometric distortion, provides the coordinate co
 | Phase | Work | Output / decision gate |
 | --- | --- | --- |
 | 0 | Freeze the submitted baseline metadata and create a separate post-submission run namespace. | Historical and practical studies are visibly separate. |
-| 1 | Implement the shared letterbox and coordinate-transform foundation. | Tests pass; stretch mode remains available for historical reproduction. |
-| 2 | Add a controlled Ultralytics-style train-only augmentation recipe: HSV/color jitter, horizontal flip, random affine or perspective, and optional Mosaic/MixUp with correct box filtering. Start with one component at a time. | A deterministic transform test suite and one pre-registered recipe per architecture. |
-| 3 | Run an Ultralytics parity benchmark on the new practical protocol using pretrained YOLO11n or YOLO26n. | Establish a realistic target under identical splits, image geometry, and evaluation code. |
-| 4 | Add transfer learning to the custom architectures. Prefer architecture-compatible detection pretraining for the custom YOLO26 and a modern pretrained backbone for Faster R-CNN; document every imported weight source. | Compare pretrained custom models against their frozen scratch baselines and the parity benchmark. |
-| 5 | Improve data credibility: adjudicate difficult annotations, add independent source groups, and reserve a group-disjoint final holdout before selecting a final practical model. | Final practical claim uses data that was not repeatedly used for model selection. |
+| 1 | Begin data and evaluation work: define a fresh group-disjoint holdout policy, adjudicate difficult annotations, and collect or identify additional independent source groups. | Written source-group and holdout plan; the contaminated candidate public test remains excluded. |
+| 2 | Implement the shared letterbox and coordinate-transform foundation. | Tests pass; stretch mode remains available for historical reproduction. |
+| 3 | Add a controlled Ultralytics-style train-only augmentation recipe: HSV/color jitter, horizontal flip, random affine or perspective, and optional Mosaic/MixUp with correct box filtering. Start with one component at a time. | A deterministic transform test suite and one pre-registered recipe per architecture. |
+| 4 | Run an Ultralytics parity benchmark on the new practical protocol using pretrained YOLO11n or YOLO26n. | Establish a realistic target under identical splits, image geometry, and evaluation code. |
+| 5 | Add transfer learning to the custom architectures. Prefer architecture-compatible detection pretraining for the custom YOLO26 and a modern pretrained backbone for Faster R-CNN; document every imported weight source. | Compare pretrained custom models against their frozen scratch baselines and the parity benchmark. |
+| 6 | Complete the new data/holdout work and run one final frozen evaluation only after model choices are complete. | Final practical claim uses group-disjoint data that was never used for model selection. |
 
 ## Architecture-Specific Direction
 
@@ -78,7 +81,8 @@ For every practical experiment, append a row or section with:
 
 ## Immediate Next Steps
 
-1. Create the shared `letterbox` transform API and synthetic tests.
-2. Add an explicit `--resize-mode stretch|letterbox` argument defaulting to `stretch` for historical reproducibility.
-3. Run a one-epoch smoke test for both architectures in `letterbox` mode.
-4. Only then launch one fixed post-submission grouped-CV letterbox baseline per architecture.
+1. Start the data work: create a source-group inventory, annotation-adjudication checklist, and fresh-holdout acquisition rule.
+2. Create the shared `letterbox` transform API and synthetic tests.
+3. Add an explicit `--resize-mode stretch|letterbox` argument defaulting to `stretch` for historical reproducibility.
+4. Run a one-epoch smoke test for both architectures in `letterbox` mode.
+5. Only then launch one fixed post-submission grouped-CV letterbox baseline per architecture.

@@ -4,12 +4,12 @@
 >
 > **Separate from the AI accountability log:** This file records engineering work and experiment evidence. `AI_Log.md` is not edited automatically.
 >
-> **Last updated:** 2026-08-11 — a separate post-submission practical-improvement roadmap was added; no submitted baseline, dataset, checkpoint, or experimental result was changed.
+> **Last updated:** 2026-08-11 — the separate post-submission roadmap was reordered by execution dependency; no submitted baseline, dataset, checkpoint, or experimental result was changed.
 
 ## 1. Current Decision
 
 - **Repository organization:** runtime modules and grading-facing Markdown documents remain at the repository root to preserve stable commands and easy navigation. Presentation and reference assets live under `docs/`; test modules live under `tests/`; generated data, checkpoints, archives, recordings, and editor artifacts remain ignored. See [README.md](README.md#repository-structure).
-- **Post-submission practical study:** future transfer-learning and Ultralytics-style engineering work is separate from the submitted strict-scratch study. [POST_SUBMISSION_PRACTICAL_PLAN.md](POST_SUBMISSION_PRACTICAL_PLAN.md) defines its preserved-baseline policy, data/evaluation rules, and ordered implementation phases. Its first planned implementation is shared letterbox geometry and transform tests; no new training has begun.
+- **Post-submission practical study:** future transfer-learning and Ultralytics-style engineering work is separate from the submitted strict-scratch study. [POST_SUBMISSION_PRACTICAL_PLAN.md](POST_SUBMISSION_PRACTICAL_PLAN.md) orders its requirements by execution dependency: data and protected-holdout work starts immediately, shared letterbox geometry is the first code implementation, and detector pretraining follows the validated transform foundation. No new training has begun.
 - **Clean RGB reference:** `runs/yolo26/baseline_seed42_e50/best.pt`, trained on `processed-data/baseline` with normalized labels and seed `42`.
 - **Provisional relative preprocessing result:** `runs/yolo26/clahe_seed42_e50/best.pt` has the highest observed validation mAP50 (`0.0674`) and mAP50-95 (`0.0274`) among the three clean preprocessing variants. Because validation shares exact image content with training, it is not an independent generalization selection.
 - **Selection caveat:** CLAHE's improvement over RGB is very small and comes with lower warping AP50 (`0.0058` versus `0.0137`). The three-way comparison remains a controlled relative comparison under the same split, but it is not evidence of a statistically decisive or leakage-free preprocessing improvement.
