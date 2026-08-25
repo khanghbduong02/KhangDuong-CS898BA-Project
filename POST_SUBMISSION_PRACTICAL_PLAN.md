@@ -17,27 +17,59 @@ Current submitted grouped-CV development baselines at 960 pixels:
 
 Reaching a credible Ultralytics-level practical system requires all three items below. They are separate from, and do not change, the submitted strict-scratch study.
 
-Requirements 1 and 2 begin in parallel: data/holdout work must start immediately, while the training-stack foundation is the first code implementation. Detector pretraining follows the validated geometry and transform contract.
+The dataset, labels, grouped folds, and public-test boundary are frozen for this study. The active work is therefore the Ultralytics-style training stack first, followed by detector pretraining; data improvement is explicitly deferred.
 
 | Execution order | Requirement | Why It Is Needed | Plan Phases | Status |
 | --- | --- | --- | --- | --- |
-| 1. Start immediately | More independent, consistent data and a protected holdout | Sparse minority examples, ambiguous boxes, and repeatedly reused folds limit both real-world generalization and trustworthy model selection. | Phases 1 and 6 | Start data audit, source-group collection, and holdout design now; this runs in parallel with the first code work. |
-| 2. First code implementation | Mature training stack | Official Ultralytics systems combine correct image geometry, strong train-only augmentation, tuned optimization, losses, normalization, and postprocessing. | Phases 2-4 | Implement shared letterbox geometry first, then controlled augmentation and an Ultralytics parity benchmark. |
-| 3. After the transform foundation | Detector pretraining | Large-scale detection pretraining provides transferable visual features and localization priors that the current 3D-print dataset cannot supply from scratch. | Phase 5 | Begin only after letterbox and evaluation parity are validated; use grouped folds as development data only. |
+| 1. First code implementation | Mature training stack | Official Ultralytics systems combine correct image geometry, strong train-only augmentation, tuned optimization, losses, normalization, and postprocessing. | Phases 1-3 | **Active now:** implement shared letterbox geometry, then controlled augmentation and an Ultralytics parity benchmark. |
+| 2. After the transform foundation | Detector pretraining | Large-scale detection pretraining provides transferable visual features and localization priors that the frozen 3D-print dataset cannot supply from scratch. | Phase 4 | Begin only after letterbox and evaluation parity are validated; use the existing grouped folds as development data only. |
+| 3. Deferred beyond this study | More independent, consistent data and a protected holdout | Sparse minority examples, ambiguous boxes, and repeatedly reused folds limit real-world generalization and final-claim credibility. | Deferred | Do not alter, clean, collect, or reserve data in this same-dataset performance study. |
 
-This ordering does not mean waiting for new data before improving the code. It means data credibility begins first and continues throughout the study, while letterbox geometry is the first implementation task and pretraining is the next major performance intervention.
+This study may improve same-fold development performance, but it cannot turn the reused grouped folds into an independent generalization claim. A future data-improvement study remains necessary for that purpose and must use a separate protocol.
 
 ## Rules For The New Study
 
 - Use a distinct `post_submission` run root and record every setting, checkpoint, dataset manifest, and result.
-- Treat the existing grouped folds as development data only. Do not use the contaminated candidate public test split for tuning or final claims.
-- Before reporting a final practical result, reserve or collect a group-disjoint holdout that remains untouched until all model choices are frozen.
+- Freeze the existing `cv-data/roboflow-3d-print-fail-v1/` dataset, labels, grouped folds, class taxonomy, preprocessing inputs, and public candidate test boundary. Do not clean labels, collect data, create a holdout, or regenerate folds in this study.
+- Treat the existing grouped folds as development data only. Do not use the contaminated candidate public test split for tuning, model selection, or final claims.
 - Clearly label pretrained weights, Ultralytics components, and external data. This is transfer learning and practical engineering, not strict scratch learning.
 - Keep the original submitted checkpoints and metrics unchanged as historical baselines.
 
-## First Code Implementation: Shared Letterbox And Transform Foundation
+## Deferred Data And Holdout Governance
 
-**Implement this first.** Both custom datasets currently stretch each image directly to a square. Add a shared transform module that:
+Data work is not active in the frozen-dataset practical study. The following utilities and local artifacts were created before the scope was frozen; retain them for a separate future data-governance study, but do not use them to alter the current data, labels, folds, or reported comparisons.
+
+### Completed automated groundwork
+
+- [x] Added [prepare_post_submission_data_inventory.py](prepare_post_submission_data_inventory.py), which reads one canonical grouped-CV fold, validates every manifest row against its materialized strict label, and creates ignored local governance artifacts without changing data.
+- [x] Generated the canonical development inventory from fold 1: `3,421` image records in `823` source/perceptual groups. Existing group coverage is Spaghetti `645`, Layer Cracking `57`, Over Extrusion `70`, Stringing `59`, and Warping `80` groups.
+- [x] Created `source_group_inventory.csv`, `development_image_registry.csv`, and `holdout_intake_template.csv` under ignored `review-data/post_submission_data_inventory/`.
+- [x] Added [screen_post_submission_holdout.py](screen_post_submission_holdout.py), which blocks a future holdout candidate when it overlaps the development registry by exact SHA-256 hash, source stem, or perceptual hash at the grouping threshold. It also requires documented new-provider, physical-printer/job, capture-session, and reviewer-confirmed provenance.
+- [x] Ran the empty-intake smoke screen. It correctly reported zero candidates; no new independent source group has been collected or approved yet.
+
+### Deferred human data work
+
+- [ ] Review the rarity-prioritized annotation queue in a separate data-governance study.
+- [ ] Create a versioned corrected-data derivative only after review decisions are complete and reproducible.
+- [ ] Collect genuinely new source groups with printer/job and capture-session provenance.
+- [ ] Fill the holdout intake template, screen every candidate against the development registry, and freeze a final holdout under a separate protocol.
+
+### Requirement 1 Commands
+
+```bash
+# Rebuild the canonical inventory and blank holdout-intake template.
+python prepare_post_submission_data_inventory.py --manifest cv-data/roboflow-3d-print-fail-v1/group_manifest.csv --fold 1 --output-dir review-data/post_submission_data_inventory --overwrite
+
+# Generate a visual review package for the rare and ambiguous classes.
+python review_grouped_annotations.py --manifest cv-data/roboflow-3d-print-fail-v1/group_manifest.csv --fold 1 --class-ids 1 3 4 --output-dir review-data/post_submission_minority_review --overwrite
+
+# Screen a populated future holdout intake against the immutable development registry.
+python screen_post_submission_holdout.py --development-registry review-data/post_submission_data_inventory/development_image_registry.csv --holdout-intake path/to/populated_holdout_intake.csv --output-dir review-data/post_submission_holdout_screen --overwrite
+```
+
+## First Active Implementation: Shared Letterbox And Transform Foundation
+
+**Completed 2026-08-24.** Both custom datasets historically stretched each image directly to a square. The new shared [image_geometry.py](image_geometry.py) module now provides a reversible `stretch|letterbox` contract that:
 
 1. letterboxes images to a fixed canvas while preserving aspect ratio;
 2. maps boxes and predictions between source, letterboxed, and model coordinates;
@@ -45,21 +77,20 @@ This ordering does not mean waiting for new data before improving the code. It m
 4. is used by both YOLO26 and Faster R-CNN training, evaluation, and demo code; and
 5. has synthetic box-round-trip and image/label alignment tests.
 
-Why first: it removes avoidable geometric distortion, provides the coordinate contract required for Ultralytics-style augmentation, and lets both architectures use the same well-tested image geometry. It is more foundational than another learning-rate or batch-size sweep.
+Historical `stretch` remains the default. New post-submission checkpoints record `resize_mode`, while evaluators and custom demos restore that mode from checkpoint metadata unless explicitly overridden. K-fold runners include it in their frozen settings and output distinct metric filenames when an evaluator override is supplied.
 
-**Acceptance gate:** existing historical behavior remains reproducible through an explicit `stretch` mode, and letterbox round trips recover source boxes within one pixel after clipping.
+**Validation completed:** synthetic stretch compatibility, label/detection round trips, both dataset target contracts, demo restoration, runner forwarding, K-fold dry runs, and one-epoch CUDA smokes passed for both architectures. The tiny YOLO26 smoke used `22` train / `11` validation images; the tiny Faster R-CNN smoke used `4` train / `2` validation images. Their zero AP values are geometry-smoke outcomes, not reportable performance results. Both evaluators restored `resize_mode=letterbox` from their new checkpoints without a CLI override.
 
 ## Ordered Roadmap
 
 | Phase | Work | Output / decision gate |
 | --- | --- | --- |
 | 0 | Freeze the submitted baseline metadata and create a separate post-submission run namespace. | Historical and practical studies are visibly separate. |
-| 1 | Begin data and evaluation work: define a fresh group-disjoint holdout policy, adjudicate difficult annotations, and collect or identify additional independent source groups. | Written source-group and holdout plan; the contaminated candidate public test remains excluded. |
-| 2 | Implement the shared letterbox and coordinate-transform foundation. | Tests pass; stretch mode remains available for historical reproduction. |
-| 3 | Add a controlled Ultralytics-style train-only augmentation recipe: HSV/color jitter, horizontal flip, random affine or perspective, and optional Mosaic/MixUp with correct box filtering. Start with one component at a time. | A deterministic transform test suite and one pre-registered recipe per architecture. |
-| 4 | Run an Ultralytics parity benchmark on the new practical protocol using pretrained YOLO11n or YOLO26n. | Establish a realistic target under identical splits, image geometry, and evaluation code. |
-| 5 | Add transfer learning to the custom architectures. Prefer architecture-compatible detection pretraining for the custom YOLO26 and a modern pretrained backbone for Faster R-CNN; document every imported weight source. | Compare pretrained custom models against their frozen scratch baselines and the parity benchmark. |
-| 6 | Complete the new data/holdout work and run one final frozen evaluation only after model choices are complete. | Final practical claim uses group-disjoint data that was never used for model selection. |
+| 1 | Implement the shared letterbox and coordinate-transform foundation. | **Completed:** tests, K-fold dry runs, and two CUDA geometry smokes passed; stretch remains historical default. |
+| 2 | Add a controlled Ultralytics-style train-only augmentation recipe: HSV/color jitter, horizontal flip, random affine or perspective, and optional Mosaic/MixUp with correct box filtering. Start with one component at a time. | A deterministic transform test suite and one pre-registered recipe per architecture. |
+| 3 | Run an Ultralytics parity benchmark on the frozen existing grouped folds using pretrained YOLO11n or YOLO26n. | Establish the target under matching fold inputs, image geometry, and project evaluation code. |
+| 4 | Add transfer learning to the custom architectures. Prefer architecture-compatible detection pretraining for the custom YOLO26 and a modern pretrained backbone for Faster R-CNN; document every imported weight source. | Compare pretrained custom models against their frozen scratch baselines and the parity benchmark. |
+| 5 | Freeze practical-model settings and report same-fold grouped-development results with an explicit selection-aligned limitation. | No candidate public-test use and no independent-generalization claim. |
 
 ## Architecture-Specific Direction
 
@@ -81,8 +112,7 @@ For every practical experiment, append a row or section with:
 
 ## Immediate Next Steps
 
-1. Start the data work: create a source-group inventory, annotation-adjudication checklist, and fresh-holdout acquisition rule.
-2. Create the shared `letterbox` transform API and synthetic tests.
-3. Add an explicit `--resize-mode stretch|letterbox` argument defaulting to `stretch` for historical reproducibility.
-4. Run a one-epoch smoke test for both architectures in `letterbox` mode.
-5. Only then launch one fixed post-submission grouped-CV letterbox baseline per architecture.
+1. Run one fixed post-submission grouped-CV letterbox baseline per architecture, using distinct run roots and no other setting changes.
+2. Compare each letterbox result with its matching historical stretch baseline; do not adopt letterbox unless the full three-fold result supports it.
+3. If letterbox is retained or its trade-off is documented, implement exactly one controlled Ultralytics-style train-only augmentation component with transform tests before beginning a full CV run.
+4. Do not introduce pretrained weights until the geometry and first augmentation component have a documented full-CV outcome.

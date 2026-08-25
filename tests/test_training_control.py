@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from torch.optim import SGD
 
-from run_faster_rcnn_kfold_cv import completed_run_matches as faster_rcnn_completed_run_matches
-from run_yolo26_kfold_cv import completed_run_matches as yolo26_completed_run_matches
+from run_faster_rcnn_kfold_cv import (
+    build_train_command as build_faster_rcnn_train_command,
+    completed_run_matches as faster_rcnn_completed_run_matches,
+)
+from run_yolo26_kfold_cv import (
+    build_train_command as build_yolo26_train_command,
+    completed_run_matches as yolo26_completed_run_matches,
+)
 from training_control import (
     EpochLRScheduleConfig,
     EpochLRScheduler,
@@ -210,6 +217,7 @@ def test_kfold_runners_accept_early_stopped_checkpoints() -> None:
                     "warmup_start_factor": 0.1,
                     "cosine_final_factor": 0.02,
                     "online_augmentation": "none",
+                    "resize_mode": "stretch",
                     "ema_decay": 0.0,
                 },
                 ("defect",),
@@ -217,6 +225,64 @@ def test_kfold_runners_accept_early_stopped_checkpoints() -> None:
             assert matches, mismatches
             assert completed
             assert epoch == 42
+
+
+def test_kfold_train_commands_forward_resize_mode() -> None:
+    """New geometry studies cannot silently fall back to historical stretch mode."""
+    shared = {
+        "epochs": 1,
+        "batch_size": 2,
+        "imgsz": 640,
+        "resize_mode": "letterbox",
+        "lr": 1e-4,
+        "weight_decay": 5e-4,
+        "workers": 0,
+        "fraction": 0.01,
+        "seed": 42,
+        "device": "cpu",
+        "scale": "s",
+        "use_p2": False,
+        "class_positive_weight_power": 0.0,
+        "balanced_sampling": False,
+        "balanced_sampling_power": 1.0,
+        "online_augmentation": "none",
+        "reduce_lr_patience": 0,
+        "reduce_lr_factor": 0.5,
+        "reduce_lr_cooldown": 0,
+        "min_lr": 1e-6,
+        "early_stopping_patience": 0,
+        "early_stopping_min_delta": 0.0,
+        "lr_schedule": "constant",
+        "warmup_epochs": 0,
+        "warmup_start_factor": 0.1,
+        "cosine_final_factor": 0.02,
+        "ema_decay": 0.0,
+        "checkpoint_selection": "map50",
+    }
+    fold_root = Path("fold_1")
+    run_dir = Path("runs") / "fold_1"
+
+    yolo_args = SimpleNamespace(
+        **shared,
+        box_gain=7.5,
+        cls_gain=0.5,
+        reg_gain=1.5,
+        reg_max=1,
+        one2many_topk=10,
+        one2one_topk=1,
+        focal_gamma=2.0,
+    )
+    faster_args = SimpleNamespace(
+        **shared,
+        backbone_weights="none",
+        backbone_lr_multiplier=1.0,
+    )
+    for command in (
+        build_yolo26_train_command(yolo_args, fold_root, run_dir, num_classes=5),
+        build_faster_rcnn_train_command(faster_args, fold_root, run_dir, num_classes=5),
+    ):
+        resize_index = command.index("--resize-mode")
+        assert command[resize_index + 1] == "letterbox"
 
 
 def main() -> None:
@@ -236,6 +302,8 @@ def main() -> None:
     print("checkpoint_selection_modes: passed")
     test_kfold_runners_accept_early_stopped_checkpoints()
     print("kfold_runners_accept_early_stopped_checkpoints: passed")
+    test_kfold_train_commands_forward_resize_mode()
+    print("kfold_train_commands_forward_resize_mode: passed")
 
 
 if __name__ == "__main__":

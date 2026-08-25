@@ -17,6 +17,7 @@ from cv_utils import (
     render_fold_path,
     validate_cv_layout,
 )
+from image_geometry import RESIZE_MODE_CHOICES
 from yolo_dataset_config import YoloDatasetConfig
 
 
@@ -56,6 +57,8 @@ def build_eval_command(
         "--metrics-output",
         str(metrics_output),
     ]
+    if args.resize_mode is not None:
+        command.extend(("--resize-mode", args.resize_mode))
     if args.tta_hflip:
         command.append("--tta-hflip")
     return command
@@ -184,6 +187,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", choices=["valid", "test"], default="valid")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument(
+        "--resize-mode",
+        choices=RESIZE_MODE_CHOICES,
+        default=None,
+        help="Optional evaluator override; omit to restore each checkpoint's saved mode",
+    )
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--fraction", type=float, default=1.0)
     parser.add_argument("--device", type=str, default="cuda")
@@ -225,7 +234,12 @@ def main() -> None:
     args.output = (
         project_path(args.output)
         if args.output is not None
-        else args.run_root / f"cv_evaluation_{args.split}_per_class_nms{'_tta_hflip' if args.tta_hflip else ''}_conf_{confidence_tag(args.conf_thresh)}.json"
+        else args.run_root
+        / (
+            f"cv_evaluation_{args.split}_per_class_nms"
+            f"{'_resize_' + args.resize_mode if args.resize_mode is not None else ''}"
+            f"{'_tta_hflip' if args.tta_hflip else ''}_conf_{confidence_tag(args.conf_thresh)}.json"
+        )
     )
 
     per_fold: list[dict[str, Any]] = []
@@ -233,7 +247,9 @@ def main() -> None:
         fold_root = fold_roots[fold]
         checkpoint = render_fold_path(args.run_root, args.checkpoint_template, fold)
         metrics_output = checkpoint.parent / (
-            f"{args.split}_metrics_per_class_nms{'_tta_hflip' if args.tta_hflip else ''}_conf_{confidence_tag(args.conf_thresh)}.json"
+            f"{args.split}_metrics_per_class_nms"
+            f"{'_resize_' + args.resize_mode if args.resize_mode is not None else ''}"
+            f"{'_tta_hflip' if args.tta_hflip else ''}_conf_{confidence_tag(args.conf_thresh)}.json"
         )
         command = build_eval_command(args, checkpoint, fold_root, metrics_output)
         print(f"\n===== CUSTOM FASTER R-CNN EVALUATE FOLD {position}/{len(folds)} (fold_{fold}) =====", flush=True)
@@ -272,6 +288,7 @@ def main() -> None:
             "nms_score_threshold": args.nms_score_thresh,
             "max_det": args.max_det,
             "tta_hflip": args.tta_hflip,
+            "resize_mode_override": args.resize_mode,
         },
         "dataset": {
             "num_classes": dataset_config.num_classes,

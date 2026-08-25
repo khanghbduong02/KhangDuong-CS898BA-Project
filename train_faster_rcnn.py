@@ -19,6 +19,13 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
+from image_geometry import (
+    DEFAULT_RESIZE_MODE,
+    RESIZE_MODE_CHOICES,
+    resize_image,
+    source_yolo_to_model_xyxy,
+    validate_resize_mode,
+)
 from model_ema import DEFAULT_EMA_DECAY, ModelEMA, validate_ema_decay
 from models.faster_rcnn import build_faster_rcnn
 from online_augmentation import (
@@ -122,6 +129,7 @@ class FasterRCNNDataset(Dataset):
         num_classes: int,
         fraction: float = 1.0,
         online_augmentation: str = DEFAULT_ONLINE_AUGMENTATION,
+        resize_mode: str = DEFAULT_RESIZE_MODE,
     ) -> None:
         if imgsz <= 0:
             raise ValueError("imgsz must be positive")
@@ -135,6 +143,7 @@ class FasterRCNNDataset(Dataset):
         self.imgsz = imgsz
         self.num_classes = num_classes
         self.online_augmentation = validate_online_augmentation(online_augmentation)
+        self.resize_mode = validate_resize_mode(resize_mode)
         if not self.images_dir.is_dir() or not self.labels_dir.is_dir():
             raise FileNotFoundError(
                 f"Expected images/ and labels/ directories under split root {split_root}"
@@ -158,22 +167,18 @@ class FasterRCNNDataset(Dataset):
             raise FileNotFoundError(f"Cannot read image: {image_path}")
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        orig_h, orig_w = image.shape[:2]
-
-        if self.imgsz < orig_w or self.imgsz < orig_h:
-            interp = cv2.INTER_AREA
-        elif self.imgsz > orig_w or self.imgsz > orig_h:
-            interp = cv2.INTER_CUBIC
-        else:
-            interp = cv2.INTER_LINEAR
-
-        image = cv2.resize(image, (self.imgsz, self.imgsz), interpolation=interp)
+        image, transform = resize_image(
+            image,
+            target_height=self.imgsz,
+            target_width=self.imgsz,
+            resize_mode=self.resize_mode,
+        )
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
         image_tensor = apply_online_augmentation(image_tensor, self.online_augmentation)
 
         label_path = self.labels_dir / f"{image_path.stem}.txt"
         raw = read_yolo_label(label_path, self.num_classes)
-        converted = xywhn_to_xyxy(raw[:, 1:5], self.imgsz).clamp(min=0.0, max=float(self.imgsz))
+        converted = source_yolo_to_model_xyxy(raw, transform)
         keep = (converted[:, 2] > converted[:, 0]) & (converted[:, 3] > converted[:, 1])
 
         boxes_xyxy = converted[keep]
@@ -452,6 +457,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
     parser.add_argument("--imgsz", type=int, default=640, help="Square input image size")
+    parser.add_argument(
+        "--resize-mode",
+        choices=RESIZE_MODE_CHOICES,
+        default=DEFAULT_RESIZE_MODE,
+        help="Input geometry policy; stretch preserves historical behavior and letterbox preserves aspect ratio",
+    )
     parser.add_argument("--lr", type=float, default=1e-4, help="AdamW learning rate.")
     parser.add_argument("--weight-decay", type=float, default=5e-4, help="AdamW weight decay.")
     parser.add_argument("--workers", type=int, default=0)
@@ -554,6 +565,7 @@ def main() -> None:
     if args.backbone_weights == "imagenet" and args.scale not in {"s", "m"}:
         raise ValueError("--backbone-weights imagenet supports only --scale s or m")
     args.online_augmentation = validate_online_augmentation(args.online_augmentation)
+    args.resize_mode = validate_resize_mode(args.resize_mode)
     args.ema_decay = validate_ema_decay(args.ema_decay)
     training_control_config = plateau_early_stopping_config_from_args(args)
     epoch_lr_schedule_config = epoch_lr_schedule_config_from_args(args)
@@ -594,12 +606,14 @@ def main() -> None:
         num_classes=num_classes,
         fraction=args.fraction,
         online_augmentation=args.online_augmentation,
+        resize_mode=args.resize_mode,
     )
     valid_dataset = FasterRCNNDataset(
         valid_root,
         imgsz=args.imgsz,
         num_classes=num_classes,
         fraction=args.fraction,
+        resize_mode=args.resize_mode,
     )
     class_positive_weights, class_box_counts = build_positive_class_weights(
         train_dataset,
@@ -671,6 +685,7 @@ def main() -> None:
         f"use_p2={args.use_p2} feature_strides={model.feature_strides}"
     )
     print(f"Dataset classes: nc={num_classes} names={class_names}")
+    print(f"Input geometry: resize_mode={args.resize_mode} imgsz={args.imgsz}")
     class_count_summary = ", ".join(
         f"class_{class_id}:{count}" for class_id, count in enumerate(class_box_counts)
     )

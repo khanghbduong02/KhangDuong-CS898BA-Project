@@ -19,6 +19,14 @@ import cv2
 import torch
 
 from cv_utils import VALID_IMAGE_EXTENSIONS
+from image_geometry import (
+    DEFAULT_RESIZE_MODE,
+    RESIZE_MODE_CHOICES,
+    ResizeTransform,
+    resize_image,
+    resolve_resize_mode,
+    restore_detections_to_source,
+)
 from models.yolo26_torch import build_yolo26, class_aware_nms
 from yolo_dataset_config import read_yolo_dataset_config
 
@@ -52,6 +60,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Square custom-model inference size; defaults to the checkpoint training value",
+    )
+    parser.add_argument(
+        "--resize-mode",
+        choices=RESIZE_MODE_CHOICES,
+        default=None,
+        help="Input geometry policy; defaults to checkpoint metadata or legacy stretch",
     )
     parser.add_argument("--batch-size", type=int, default=8, help="Images per inference batch")
     parser.add_argument("--conf", type=float, default=0.25, help="Prediction confidence floor for displayed detections")
@@ -127,6 +141,14 @@ def _checkpoint_imgsz(checkpoint: dict[str, Any], requested_imgsz: int | None) -
     return imgsz
 
 
+def _checkpoint_resize_mode(
+    checkpoint: dict[str, Any],
+    requested_resize_mode: str | None,
+) -> str:
+    saved_args = checkpoint.get("args", {})
+    return resolve_resize_mode(requested_resize_mode, saved_args)
+
+
 def discover_images(source: Path, max_images: int, image_names: Sequence[str] | None) -> list[Path]:
     if max_images < 0:
         raise ValueError("--max-images must be zero or positive")
@@ -156,17 +178,19 @@ def discover_images(source: Path, max_images: int, image_names: Sequence[str] | 
     return selected if max_images == 0 else selected[:max_images]
 
 
-def _resize_for_model(image_bgr: Any, imgsz: int) -> torch.Tensor:
-    """Use the custom evaluator's RGB conversion and square-stretch resize policy."""
-    original_h, original_w = image_bgr.shape[:2]
-    if imgsz < original_w or imgsz < original_h:
-        interpolation = cv2.INTER_AREA
-    elif imgsz > original_w or imgsz > original_h:
-        interpolation = cv2.INTER_CUBIC
-    else:
-        interpolation = cv2.INTER_LINEAR
+def _resize_for_model(
+    image_bgr: Any,
+    imgsz: int,
+    resize_mode: str = DEFAULT_RESIZE_MODE,
+) -> torch.Tensor:
+    """Convert BGR inputs to the shared stretch or letterbox model canvas."""
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    resized = cv2.resize(image_rgb, (imgsz, imgsz), interpolation=interpolation)
+    resized, _ = resize_image(
+        image_rgb,
+        target_height=imgsz,
+        target_width=imgsz,
+        resize_mode=resize_mode,
+    )
     return torch.from_numpy(resized).permute(2, 0, 1).float() / 255.0
 
 
@@ -204,15 +228,22 @@ def _read_ground_truth(label_path: Path, class_names: Sequence[str], image_width
     return ground_truth
 
 
-def _scale_detections_to_source(detections: torch.Tensor, image_width: int, image_height: int, imgsz: int) -> torch.Tensor:
-    scaled = detections.detach().cpu().clone()
-    if scaled.numel() == 0:
-        return scaled
-    scaled[:, 0] = (scaled[:, 0] * image_width / imgsz).clamp(0.0, float(image_width))
-    scaled[:, 2] = (scaled[:, 2] * image_width / imgsz).clamp(0.0, float(image_width))
-    scaled[:, 1] = (scaled[:, 1] * image_height / imgsz).clamp(0.0, float(image_height))
-    scaled[:, 3] = (scaled[:, 3] * image_height / imgsz).clamp(0.0, float(image_height))
-    return scaled
+def _scale_detections_to_source(
+    detections: torch.Tensor,
+    image_width: int,
+    image_height: int,
+    imgsz: int,
+    resize_mode: str = DEFAULT_RESIZE_MODE,
+) -> torch.Tensor:
+    """Restore model-canvas detections using the same geometry as inference."""
+    transform = ResizeTransform.from_shapes(
+        source_height=image_height,
+        source_width=image_width,
+        target_height=imgsz,
+        target_width=imgsz,
+        resize_mode=resize_mode,
+    )
+    return restore_detections_to_source(detections.detach().cpu(), transform)
 
 
 def _draw_label(image: Any, text: str, origin: tuple[int, int], color: tuple[int, int, int]) -> None:
@@ -303,6 +334,7 @@ def main() -> None:
 
     scale, reg_max, use_p2 = _checkpoint_model_settings(checkpoint)
     imgsz = _checkpoint_imgsz(checkpoint, args.imgsz)
+    resize_mode = _checkpoint_resize_mode(checkpoint, args.resize_mode)
     checkpoint_weight_source = str(checkpoint.get("checkpoint_weight_source", "raw"))
     if checkpoint_weight_source not in {"raw", "ema"}:
         raise ValueError(f"Unsupported checkpoint weight source: {checkpoint_weight_source!r}")
@@ -326,7 +358,7 @@ def main() -> None:
         image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image_bgr is None:
             raise FileNotFoundError(f"Unable to read image: {image_path}")
-        loaded_images.append((image_path, image_bgr, _resize_for_model(image_bgr, imgsz)))
+        loaded_images.append((image_path, image_bgr, _resize_for_model(image_bgr, imgsz, resize_mode)))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summary_images: list[dict[str, Any]] = []
@@ -351,7 +383,13 @@ def main() -> None:
 
         for offset, ((image_path, image_bgr, _), detections) in enumerate(zip(batch, batch_detections), start=start + 1):
             image_height, image_width = image_bgr.shape[:2]
-            scaled_detections = _scale_detections_to_source(detections, image_width, image_height, imgsz)
+            scaled_detections = _scale_detections_to_source(
+                detections,
+                image_width,
+                image_height,
+                imgsz,
+                resize_mode,
+            )
             ground_truth = (
                 _read_ground_truth(
                     args.labels_dir / f"{image_path.stem}.txt",
@@ -395,6 +433,7 @@ def main() -> None:
         "class_names": list(class_names),
         "inference_settings": {
             "imgsz": imgsz,
+            "resize_mode": resize_mode,
             "batch_size": args.batch_size,
             "confidence_threshold": args.conf,
             "inference_branch": args.inference_branch,

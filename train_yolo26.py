@@ -17,6 +17,13 @@ from ultralytics.utils.ops import xywh2xyxy
 from ultralytics.utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors
 
 from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
+from image_geometry import (
+    DEFAULT_RESIZE_MODE,
+    RESIZE_MODE_CHOICES,
+    resize_image,
+    source_yolo_to_model_yolo,
+    validate_resize_mode,
+)
 from model_ema import DEFAULT_EMA_DECAY, ModelEMA, validate_ema_decay
 from models.yolo26_torch import build_yolo26, class_aware_nms
 from online_augmentation import (
@@ -77,11 +84,13 @@ class YoloDetectionDataset(Dataset):
         imgsz: int,
         fraction: float = 1.0,
         online_augmentation: str = DEFAULT_ONLINE_AUGMENTATION,
+        resize_mode: str = DEFAULT_RESIZE_MODE,
     ) -> None:
         self.images_dir = split_root / "images"
         self.labels_dir = split_root / "labels"
         self.imgsz = imgsz
         self.online_augmentation = validate_online_augmentation(online_augmentation)
+        self.resize_mode = validate_resize_mode(resize_mode)
 
         image_paths = [
             path
@@ -104,17 +113,12 @@ class YoloDetectionDataset(Dataset):
             raise FileNotFoundError(f"Unable to read image: {image_path}")
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        original_h, original_w = image.shape[:2]
-        target_w = self.imgsz
-        target_h = self.imgsz
-        if target_w < original_w or target_h < original_h:
-            interpolation = cv2.INTER_AREA
-        elif target_w > original_w or target_h > original_h:
-            interpolation = cv2.INTER_CUBIC
-        else:
-            interpolation = cv2.INTER_LINEAR
-
-        image = cv2.resize(image, (target_w, target_h), interpolation=interpolation)
+        image, transform = resize_image(
+            image,
+            target_height=self.imgsz,
+            target_width=self.imgsz,
+            resize_mode=self.resize_mode,
+        )
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
         image_tensor = apply_online_augmentation(image_tensor, self.online_augmentation)
 
@@ -143,8 +147,12 @@ class YoloDetectionDataset(Dataset):
 
                 labels.append([class_id, x_center, y_center, width, height])
 
-        labels_tensor = torch.tensor(labels, dtype=torch.float32) if labels else torch.zeros((0, 5), dtype=torch.float32)
-        return image_tensor, labels_tensor
+        labels_tensor = (
+            torch.tensor(labels, dtype=torch.float32)
+            if labels
+            else torch.zeros((0, 5), dtype=torch.float32)
+        )
+        return image_tensor, source_yolo_to_model_yolo(labels_tensor, transform)
 
 
 def collate_fn(batch: Sequence[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
@@ -689,6 +697,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
     parser.add_argument("--imgsz", type=int, default=640, help="Square input image size")
+    parser.add_argument(
+        "--resize-mode",
+        choices=RESIZE_MODE_CHOICES,
+        default=DEFAULT_RESIZE_MODE,
+        help="Input geometry policy; stretch preserves historical behavior and letterbox preserves aspect ratio",
+    )
     parser.add_argument("--lr", type=float, default=1e-4, help="Initial learning rate")
     parser.add_argument("--weight-decay", type=float, default=5e-4, help="AdamW weight decay")
     parser.add_argument("--workers", type=int, default=2, help="DataLoader worker count")
@@ -794,6 +808,7 @@ def main() -> None:
     if args.reg_max <= 0:
         raise ValueError("--reg-max must be positive")
     args.online_augmentation = validate_online_augmentation(args.online_augmentation)
+    args.resize_mode = validate_resize_mode(args.resize_mode)
     args.ema_decay = validate_ema_decay(args.ema_decay)
     training_control_config = plateau_early_stopping_config_from_args(args)
     epoch_lr_schedule_config = epoch_lr_schedule_config_from_args(args)
@@ -807,8 +822,14 @@ def main() -> None:
         imgsz=args.imgsz,
         fraction=args.fraction,
         online_augmentation=args.online_augmentation,
+        resize_mode=args.resize_mode,
     )
-    valid_dataset = YoloDetectionDataset(valid_root, imgsz=args.imgsz, fraction=args.fraction)
+    valid_dataset = YoloDetectionDataset(
+        valid_root,
+        imgsz=args.imgsz,
+        fraction=args.fraction,
+        resize_mode=args.resize_mode,
+    )
     class_positive_weights, class_box_counts = build_positive_class_weights(
         train_dataset,
         args.num_classes,
@@ -902,6 +923,7 @@ def main() -> None:
     print(f"Classification focal gamma={args.focal_gamma:g}")
     print(f"Box regression: reg_max={args.reg_max} ({'DFL' if args.reg_max > 1 else 'direct distances'})")
     print(f"Detection feature strides={model_strides} use_p2={args.use_p2}")
+    print(f"Input geometry: resize_mode={args.resize_mode} imgsz={args.imgsz}")
     print(
         f"Online training augmentation: {args.online_augmentation} "
         "(validation images, labels, and source files unchanged)"

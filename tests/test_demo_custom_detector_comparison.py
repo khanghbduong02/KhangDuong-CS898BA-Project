@@ -16,6 +16,7 @@ from demo_custom_detector_comparison import (
     compose_comparison_grid,
     select_comparison_images,
 )
+from demo_custom_yolo26 import _scale_detections_to_source
 
 
 def test_comparison_grid_panel_order() -> None:
@@ -105,6 +106,21 @@ def test_ground_truth_coverage_image_selection() -> None:
         assert [path.name for path in selected] == ["a.jpg", "b.jpg", "d.jpg", "e.jpg"]
 
 
+def test_demo_letterbox_detection_restoration() -> None:
+    """The custom demo restores letterboxed model detections to source coordinates."""
+    detections = torch.tensor([[160.0, 240.0, 480.0, 400.0, 0.9, 2.0]])
+    restored = _scale_detections_to_source(
+        detections,
+        image_width=400,
+        image_height=200,
+        imgsz=640,
+        resize_mode="letterbox",
+    )
+
+    assert torch.allclose(restored[:, :4], torch.tensor([[100.0, 50.0, 300.0, 150.0]]))
+    assert torch.equal(restored[:, 4:], detections[:, 4:])
+
+
 def main() -> None:
     test_comparison_grid_panel_order()
     print("comparison_grid_panel_order: passed")
@@ -114,6 +130,8 @@ def main() -> None:
     print("scratch_faster_rcnn_checkpoint_guard: passed")
     test_ground_truth_coverage_image_selection()
     print("ground_truth_coverage_image_selection: passed")
+    test_demo_letterbox_detection_restoration()
+    print("demo_letterbox_detection_restoration: passed")
 
 
 if __name__ == "__main__":

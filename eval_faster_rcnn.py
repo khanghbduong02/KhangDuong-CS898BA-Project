@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from detection_metrics import compute_detection_metrics
+from image_geometry import RESIZE_MODE_CHOICES, resolve_resize_mode
 from inference_tta import merge_hflip_predictions
 from models.faster_rcnn import build_faster_rcnn
 from online_augmentation import DEFAULT_ONLINE_AUGMENTATION, validate_online_augmentation
@@ -70,6 +71,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Square input image size; defaults to the saved checkpoint value or 640",
+    )
+    parser.add_argument(
+        "--resize-mode",
+        choices=RESIZE_MODE_CHOICES,
+        default=None,
+        help="Input geometry policy; defaults to checkpoint metadata or legacy stretch",
     )
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--fraction", type=float, default=1.0,
@@ -230,6 +237,7 @@ def main() -> None:
     training_online_augmentation = validate_online_augmentation(
         str(saved_args.get("online_augmentation", DEFAULT_ONLINE_AUGMENTATION))
     )
+    args.resize_mode = resolve_resize_mode(args.resize_mode, saved_args)
     backbone_weights = str(saved_args.get("backbone_weights", "none"))
     backbone_lr_multiplier = float(saved_args.get("backbone_lr_multiplier", 1.0))
     backbone_initialization = str(checkpoint.get("backbone_initialization", "random"))
@@ -253,6 +261,7 @@ def main() -> None:
         imgsz=imgsz,
         num_classes=num_classes,
         fraction=args.fraction,
+        resize_mode=args.resize_mode,
     )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False,
@@ -337,6 +346,7 @@ def main() -> None:
                 "nms_score_threshold": args.nms_score_thresh,
                 "max_det": args.max_det,
                 "tta_hflip": args.tta_hflip,
+                "resize_mode": args.resize_mode,
                 "ema_metadata": checkpoint.get("ema_metadata"),
                 "training_online_augmentation": training_online_augmentation,
             },
@@ -351,7 +361,7 @@ def main() -> None:
         f"postprocess=per_class_nms nms_iou={args.nms_iou:g} "
         f"nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det} tta_hflip={args.tta_hflip} "
         f"checkpoint_weights={checkpoint_weight_source} "
-        f"training_online_augmentation={training_online_augmentation}"
+        f"training_online_augmentation={training_online_augmentation} resize_mode={args.resize_mode}"
     )
     print(
         f"model=faster_rcnn (scale={scale}) split={args.split} images={len(dataset)} "

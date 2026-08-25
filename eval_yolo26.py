@@ -11,6 +11,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from detection_metrics import compute_detection_metrics, xywhn_to_xyxy
+from image_geometry import (
+    DEFAULT_RESIZE_MODE,
+    RESIZE_MODE_CHOICES,
+    resolve_resize_mode,
+)
 from inference_tta import horizontal_flip_images, unflip_decoded_xyxy
 from models.yolo26_torch import build_yolo26, class_aware_nms
 from online_augmentation import DEFAULT_ONLINE_AUGMENTATION, validate_online_augmentation
@@ -25,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", type=str, choices=["valid", "test"], default="valid", help="Dataset split to evaluate")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
     parser.add_argument("--imgsz", type=int, default=640, help="Square input image size")
+    parser.add_argument(
+        "--resize-mode",
+        choices=RESIZE_MODE_CHOICES,
+        default=None,
+        help="Input geometry policy; defaults to checkpoint metadata or legacy stretch",
+    )
     parser.add_argument("--workers", type=int, default=2, help="DataLoader worker count")
     parser.add_argument("--fraction", type=float, default=1.0, help="Subset fraction for quick evaluation")
     parser.add_argument("--device", type=str, default="cuda", help="Evaluation device, e.g. cuda or cuda:0")
@@ -211,6 +222,7 @@ def main() -> None:
     training_online_augmentation = validate_online_augmentation(
         str(saved_training_args.get("online_augmentation", DEFAULT_ONLINE_AUGMENTATION))
     )
+    args.resize_mode = resolve_resize_mode(args.resize_mode, saved_training_args)
     if reg_max <= 0:
         raise ValueError("Resolved reg_max must be positive")
     class_positive_weights = _load_positive_class_weights(checkpoint, num_classes, device)
@@ -224,7 +236,12 @@ def main() -> None:
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    dataset = YoloDetectionDataset(split_root, imgsz=args.imgsz, fraction=args.fraction)
+    dataset = YoloDetectionDataset(
+        split_root,
+        imgsz=args.imgsz,
+        fraction=args.fraction,
+        resize_mode=args.resize_mode,
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -258,7 +275,7 @@ def main() -> None:
         f"inference_branch={args.inference_branch} "
         f"nms_iou={args.nms_iou:g} nms_score_thresh={args.nms_score_thresh:g} max_det={args.max_det} "
         f"tta_hflip={args.tta_hflip} checkpoint_weights={checkpoint_weight_source} "
-        f"training_online_augmentation={training_online_augmentation}"
+        f"training_online_augmentation={training_online_augmentation} resize_mode={args.resize_mode}"
     )
     model.eval()
     total_loss = 0.0
@@ -366,6 +383,7 @@ def main() -> None:
                 "nms_score_threshold": args.nms_score_thresh,
                 "max_detections": args.max_det,
                 "tta_hflip": args.tta_hflip,
+                "resize_mode": args.resize_mode,
                 "ema_metadata": checkpoint.get("ema_metadata"),
                 "training_online_augmentation": training_online_augmentation,
             },

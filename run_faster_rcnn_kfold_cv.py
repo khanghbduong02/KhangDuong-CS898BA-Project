@@ -13,6 +13,7 @@ from typing import Any
 import torch
 
 from cv_utils import PROJECT_ROOT, discover_folds, project_path, render_fold_path, validate_cv_layout
+from image_geometry import DEFAULT_RESIZE_MODE, RESIZE_MODE_CHOICES, validate_resize_mode
 from model_ema import DEFAULT_EMA_DECAY, validate_ema_decay
 from online_augmentation import (
     DEFAULT_ONLINE_AUGMENTATION,
@@ -42,6 +43,7 @@ def training_settings(args: argparse.Namespace, num_classes: int) -> dict[str, A
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "imgsz": args.imgsz,
+        "resize_mode": args.resize_mode,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "workers": args.workers,
@@ -89,6 +91,8 @@ def build_train_command(
         str(args.batch_size),
         "--imgsz",
         str(args.imgsz),
+        "--resize-mode",
+        args.resize_mode,
         "--lr",
         str(args.lr),
         "--weight-decay",
@@ -204,6 +208,8 @@ def completed_run_matches(
             actual = DEFAULT_COSINE_FINAL_FACTOR
         if key == "online_augmentation" and actual is None:
             actual = DEFAULT_ONLINE_AUGMENTATION
+        if key == "resize_mode" and actual is None:
+            actual = DEFAULT_RESIZE_MODE
         if key == "ema_decay" and actual is None:
             actual = DEFAULT_EMA_DECAY
         if not values_match(expected, actual):
@@ -287,6 +293,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, required=True, help="Identical epoch budget for every fold")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument(
+        "--resize-mode",
+        choices=RESIZE_MODE_CHOICES,
+        default=DEFAULT_RESIZE_MODE,
+        help="Input geometry policy passed unchanged to every one-fold trainer",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--workers", type=int, default=0)
@@ -348,6 +360,7 @@ def main() -> None:
     validate_training_control_compatibility(plateau_config, epoch_schedule_config)
     checkpoint_selection = validate_checkpoint_selection(args.checkpoint_selection)
     args.online_augmentation = validate_online_augmentation(args.online_augmentation)
+    args.resize_mode = validate_resize_mode(args.resize_mode)
     args.ema_decay = validate_ema_decay(args.ema_decay)
     if args.ema_decay > 0.0 and checkpoint_selection != "map50":
         raise ValueError("--ema-decay requires --checkpoint-selection map50")

@@ -191,6 +191,18 @@ The project separates one-fold model logic from cross-validation orchestration:
 - [run_faster_rcnn_kfold_cv.py](run_faster_rcnn_kfold_cv.py) and [eval_faster_rcnn_kfold_cv.py](eval_faster_rcnn_kfold_cv.py) provide the equivalent fully local Faster R-CNN workflow, including frozen-setting checkpoint checks and overall/per-class metric aggregation.
 - [run_ultralytics_kfold_cv.py](run_ultralytics_kfold_cv.py) and [eval_ultralytics_kfold_cv.py](eval_ultralytics_kfold_cv.py) provide a generic pretrained Ultralytics reference workflow for the same fold layout.
 
+### Post-submission letterbox geometry
+
+[image_geometry.py](image_geometry.py) supplies a shared input-geometry contract for the local YOLO26 and Faster R-CNN pipelines. Historical runs continue to use the default `--resize-mode stretch`, which preserves the original direct square resize. New post-submission studies can use `--resize-mode letterbox` to preserve aspect ratio on the same fixed square canvas; checkpoints save that setting, and the one-fold evaluators plus custom demos restore it automatically. Use distinct post-submission run roots and do not mix these results with the submitted stretch baselines:
+
+```bash
+python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox --epochs 50 --batch-size 8 --imgsz 960 --workers 0 --seed 42 --device cuda --scale n --focal-gamma 2 --class-positive-weight-power 0.25 --checkpoint-selection map50 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox
+
+python run_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox --epochs 50 --batch-size 2 --imgsz 960 --workers 0 --seed 42 --device cuda --scale s --class-positive-weight-power 0.25 --checkpoint-selection map50 --lr-schedule cosine --warmup-epochs 3 --warmup-start-factor 0.1 --cosine-final-factor 0.02 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox
+```
+
+The preceding one-epoch CUDA smoke checks only validate geometry, training, checkpoint metadata, and evaluator restoration; they are not reportable performance results. Do not use the candidate public test split.
+
 ### Batch demonstration
 
 [demo_custom_yolo26.py](demo_custom_yolo26.py) creates annotated batch-inference images and a JSON prediction summary from the selected local custom YOLO26 checkpoint. It is intended for the recorded final demonstration, not cross-validation metric selection. It overlays white validation ground-truth boxes and colored custom-model predictions. Use grouped validation images rather than the excluded public candidate test split:

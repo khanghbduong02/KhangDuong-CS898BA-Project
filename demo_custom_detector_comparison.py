@@ -21,6 +21,7 @@ from demo_custom_yolo26 import (
     PREDICTION_COLORS_BGR,
     _checkpoint_imgsz,
     _checkpoint_model_settings,
+    _checkpoint_resize_mode,
     _draw_label,
     _load_checkpoint as load_yolo_checkpoint,
     _read_ground_truth,
@@ -35,6 +36,7 @@ from eval_faster_rcnn import (
     _load_positive_class_weights,
     _resolve_evaluation_settings,
 )
+from image_geometry import RESIZE_MODE_CHOICES, resolve_resize_mode
 from models.faster_rcnn import build_faster_rcnn
 from models.yolo26_torch import build_yolo26, class_aware_nms
 from yolo_dataset_config import read_yolo_dataset_config
@@ -81,6 +83,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Square Faster R-CNN inference size; defaults to the Faster R-CNN checkpoint training value",
+    )
+    parser.add_argument(
+        "--yolo-resize-mode",
+        choices=RESIZE_MODE_CHOICES,
+        default=None,
+        help="YOLO26 geometry override; defaults to checkpoint metadata or legacy stretch",
+    )
+    parser.add_argument(
+        "--faster-rcnn-resize-mode",
+        choices=RESIZE_MODE_CHOICES,
+        default=None,
+        help="Faster R-CNN geometry override; defaults to checkpoint metadata or legacy stretch",
     )
     parser.add_argument("--batch-size", type=int, default=2, help="Images processed per batch by both local models")
     parser.add_argument("--conf", type=float, default=0.25, help="Display confidence floor after each model's NMS")
@@ -138,6 +152,7 @@ def _build_faster_rcnn(
     num_classes: int,
     device: torch.device,
     imgsz_override: int | None,
+    resize_mode_override: str | None,
     nms_score_thresh: float,
     nms_iou: float,
     max_det: int,
@@ -148,6 +163,7 @@ def _build_faster_rcnn(
     saved_args = checkpoint.get("args", {})
     if not isinstance(saved_args, dict):
         saved_args = {}
+    resize_mode = resolve_resize_mode(resize_mode_override, saved_args)
     backbone_weights = str(saved_args.get("backbone_weights", "none"))
     model = build_faster_rcnn(
         nc=num_classes,
@@ -168,6 +184,7 @@ def _build_faster_rcnn(
     return model, checkpoint_imgsz, {
         "scale": scale,
         "imgsz": checkpoint_imgsz,
+        "resize_mode": resize_mode,
         "use_p2": use_p2,
         "backbone_weights": backbone_weights,
         "backbone_initialization": str(checkpoint.get("backbone_initialization", "random")),
@@ -383,6 +400,7 @@ def main() -> None:
 
     yolo_scale, yolo_reg_max, yolo_use_p2 = _checkpoint_model_settings(yolo_checkpoint)
     yolo_imgsz = _checkpoint_imgsz(yolo_checkpoint, args.yolo_imgsz)
+    yolo_resize_mode = _checkpoint_resize_mode(yolo_checkpoint, args.yolo_resize_mode)
     yolo_model = build_yolo26(
         nc=dataset_config.num_classes,
         scale=yolo_scale,
@@ -401,10 +419,12 @@ def main() -> None:
         dataset_config.num_classes,
         device,
         args.faster_rcnn_imgsz,
+        args.faster_rcnn_resize_mode,
         args.nms_score_thresh,
         args.nms_iou,
         args.max_det,
     )
+    faster_rcnn_resize_mode = str(faster_rcnn_settings["resize_mode"])
     image_paths = select_comparison_images(
         args.source,
         args.labels_dir,
@@ -422,8 +442,8 @@ def main() -> None:
             (
                 image_path,
                 image_bgr,
-                _resize_for_model(image_bgr, yolo_imgsz),
-                _resize_for_model(image_bgr, faster_rcnn_imgsz),
+                _resize_for_model(image_bgr, yolo_imgsz, yolo_resize_mode),
+                _resize_for_model(image_bgr, faster_rcnn_imgsz, faster_rcnn_resize_mode),
             )
         )
 
@@ -468,7 +488,13 @@ def main() -> None:
                 image_height,
             )
             scaled_yolo = _filter_display_detections(
-                _scale_detections_to_source(yolo_detections, image_width, image_height, yolo_imgsz),
+                _scale_detections_to_source(
+                    yolo_detections,
+                    image_width,
+                    image_height,
+                    yolo_imgsz,
+                    yolo_resize_mode,
+                ),
                 args.conf,
             )
             faster_rcnn_detections = _to_zero_indexed_detection_tensor(faster_rcnn_prediction)
@@ -478,6 +504,7 @@ def main() -> None:
                     image_width,
                     image_height,
                     faster_rcnn_imgsz,
+                    faster_rcnn_resize_mode,
                 ),
                 args.conf,
             )
@@ -521,6 +548,7 @@ def main() -> None:
             "checkpoint_epoch": int(yolo_checkpoint.get("epoch", 0)),
             "checkpoint_weight_source": yolo_weight_source,
             "imgsz": yolo_imgsz,
+            "resize_mode": yolo_resize_mode,
             "scale": yolo_scale,
             "reg_max": yolo_reg_max,
             "use_p2": yolo_use_p2,
