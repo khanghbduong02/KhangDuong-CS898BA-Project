@@ -201,7 +201,10 @@ python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --ru
 python run_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox --epochs 50 --batch-size 2 --imgsz 960 --workers 0 --seed 42 --device cuda --scale s --class-positive-weight-power 0.25 --checkpoint-selection map50 --lr-schedule cosine --warmup-epochs 3 --warmup-start-factor 0.1 --cosine-final-factor 0.02 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox
 ```
 
-The preceding one-epoch CUDA smoke checks only validate geometry, training, checkpoint metadata, and evaluator restoration; they are not reportable performance results. Do not use the candidate public test split.
+The completed 3-fold grouped cross-validation evaluations under `runs/yolo26/post_submission_letterbox` and `runs/faster_rcnn/post_submission_letterbox` yielded:
+- **Custom YOLO26 (scale `n`):** mAP50 improved from the submitted stretch baseline $0.1586 \pm 0.0104$ to **$0.1985 \pm 0.0063$** (+25.2% relative gain), mAP50-95 reached $0.0691 \pm 0.0053$, precision was $0.1137 \pm 0.0073$, and recall was $0.1453 \pm 0.0139$.
+- **Custom Faster R-CNN (scale `s`):** mAP50 preserved parity with the submitted scheduled scratch baseline at **$0.3280 \pm 0.0282$** (vs $0.3258 \pm 0.0275$), mAP50-95 was $0.1198 \pm 0.0097$, precision was $0.2985 \pm 0.1086$, and recall was $0.1167 \pm 0.0183$.
+- **Status:** Letterbox is adopted as the standardized geometry for subsequent practical-track development. Detailed metrics, per-class breakdowns, and roadmap phases are documented in [POST_SUBMISSION_PRACTICAL_PLAN.md](POST_SUBMISSION_PRACTICAL_PLAN.md) and [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md). Do not evaluate on the candidate public test split.
 
 ### Batch demonstration
 

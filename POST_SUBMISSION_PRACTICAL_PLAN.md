@@ -81,13 +81,51 @@ Historical `stretch` remains the default. New post-submission checkpoints record
 
 **Validation completed:** synthetic stretch compatibility, label/detection round trips, both dataset target contracts, demo restoration, runner forwarding, K-fold dry runs, and one-epoch CUDA smokes passed for both architectures. The tiny YOLO26 smoke used `22` train / `11` validation images; the tiny Faster R-CNN smoke used `4` train / `2` validation images. Their zero AP values are geometry-smoke outcomes, not reportable performance results. Both evaluators restored `resize_mode=letterbox` from their new checkpoints without a CLI override.
 
+### Grouped-CV Letterbox Baseline Results (2026-08-24)
+
+Both architectures completed full three-fold group-disjoint cross-validation under `runs/yolo26/post_submission_letterbox` and `runs/faster_rcnn/post_submission_letterbox` at 960 px with `resize_mode=letterbox`, leaving all other selected hyperparameters, loss weights, seeds (`42`), and fold data unchanged.
+
+#### Aggregate Performance: Historical Stretch vs Post-Submission Letterbox
+
+| Detector | Image Geometry | Selected Epochs | mAP50 | mAP50-95 | Precision @ 0.25 | Recall @ 0.25 | Decision |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Custom YOLO26 (scale `n`) | Historical Stretch | 48, 47, 49 | 0.1586 ± 0.0104 | 0.0512 ± 0.0043 | 0.1106 ± 0.0060 | 0.1306 ± 0.0067 | Historical submitted scratch baseline |
+| Custom YOLO26 (scale `n`) | Post-submission Letterbox | 49, 45, 45 | **0.1985 ± 0.0063** | **0.0691 ± 0.0053** | **0.1137 ± 0.0073** | **0.1453 ± 0.0139** | **Adopted (+0.0399 mAP50 / +25.2% relative gain)** |
+| Custom Faster R-CNN (scale `s`) | Historical Stretch | 32, 46, 35 | 0.3258 ± 0.0275 | **0.1239 ± 0.0111** | 0.2960 ± 0.0525 | 0.1146 ± 0.0069 | Historical submitted scratch baseline |
+| Custom Faster R-CNN (scale `s`) | Post-submission Letterbox | 28, 42, 50 | **0.3280 ± 0.0282** | 0.1198 ± 0.0097 | **0.2985 ± 0.1086** | **0.1167 ± 0.0183** | **Adopted (Parity preserved / standardized geometry)** |
+
+#### Per-Fold Validation Metrics
+
+- **Custom YOLO26 (`post_submission_letterbox`):**
+  - Fold 1 (epoch 49): mAP50 `0.2004`, mAP50-95 `0.0739`, Precision `0.1195`, Recall `0.1296`
+  - Fold 2 (epoch 45): mAP50 `0.2036`, mAP50-95 `0.0699`, Precision `0.1161`, Recall `0.1560`
+  - Fold 3 (epoch 45): mAP50 `0.1914`, mAP50-95 `0.0634`, Precision `0.1055`, Recall `0.1504`
+  - Mean ± SD: mAP50 `0.1985 ± 0.0063`, mAP50-95 `0.0691 ± 0.0053`, Precision `0.1137 ± 0.0073`, Recall `0.1453 ± 0.0139`, Loss `6.5549 ± 0.0618`.
+- **Custom Faster R-CNN (`post_submission_letterbox`):**
+  - Fold 1 (epoch 28): mAP50 `0.3203`, mAP50-95 `0.1183`, Precision `0.1737`, Recall `0.1367`
+  - Fold 2 (epoch 42): mAP50 `0.3592`, mAP50-95 `0.1302`, Precision `0.3498`, Recall `0.1124`
+  - Fold 3 (epoch 50): mAP50 `0.3043`, mAP50-95 `0.1110`, Precision `0.3719`, Recall `0.1008`
+  - Mean ± SD: mAP50 `0.3280 ± 0.0282`, mAP50-95 `0.1198 ± 0.0097`, Precision `0.2985 ± 0.1086`, Recall `0.1167 ± 0.0183`.
+
+#### Per-Class AP50 and Recall at Threshold 0.25
+
+| Class | Ground Truth | YOLO26 Letterbox AP50 | YOLO26 Letterbox Recall | Faster R-CNN Letterbox AP50 | Faster R-CNN Letterbox Recall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Spaghetti (id 0) | 7,804 | 0.0336 ± 0.0030 | 0.1075 ± 0.0118 | 0.0434 ± 0.0049 | 0.0689 ± 0.0168 |
+| Layer cracking (id 1) | 285 | 0.1510 ± 0.0272 | 0.2526 ± 0.0482 | 0.2694 ± 0.0506 | 0.3018 ± 0.0955 |
+| Over extrusion (id 2) | 464 | 0.3432 ± 0.0354 | 0.5813 ± 0.0853 | 0.5533 ± 0.0920 | 0.6141 ± 0.0281 |
+| Stringing (id 3) | 219 | 0.0884 ± 0.0258 | 0.1918 ± 0.0362 | 0.2352 ± 0.0462 | 0.2740 ± 0.0898 |
+| Warping (id 4) | 117 | 0.3763 ± 0.0367 | 0.5897 ± 0.0769 | 0.5384 ± 0.0796 | 0.5812 ± 0.0783 |
+
+**Adoption Decision:** Letterboxing is formally adopted as the geometry standard for all practical track runs. It provides an unambiguous aggregate mAP gain (+25.2%) and consistent per-fold improvements for Custom YOLO26, while maintaining Faster R-CNN performance parity and matching official Ultralytics letterbox geometry.
+
 ## Ordered Roadmap
 
 | Phase | Work | Output / decision gate |
 | --- | --- | --- |
 | 0 | Freeze the submitted baseline metadata and create a separate post-submission run namespace. | Historical and practical studies are visibly separate. |
-| 1 | Implement the shared letterbox and coordinate-transform foundation. | **Completed:** tests, K-fold dry runs, and two CUDA geometry smokes passed; stretch remains historical default. |
-| 2 | Add a controlled Ultralytics-style train-only augmentation recipe: HSV/color jitter, horizontal flip, random affine or perspective, and optional Mosaic/MixUp with correct box filtering. Start with one component at a time. | A deterministic transform test suite and one pre-registered recipe per architecture. |
+| 1 | Implement the shared letterbox and coordinate-transform foundation. | **Completed & Adopted:** Full 3-fold grouped CV completed. YOLO26 mAP50 improved to `0.1985 ± 0.0063` (+25.2%); Faster R-CNN maintained parity at `0.3280 ± 0.0282`. Letterbox adopted as standard geometry. |
+| 2 | Add a controlled Ultralytics-style train-only augmentation recipe: HSV/color jitter, horizontal flip, random affine or perspective, and optional Mosaic/MixUp with correct box filtering. Start with one component at a time. | **Active now:** Implement Component 1 (train-only HSV photometric jitter) with deterministic unit tests and run a controlled full-CV comparison on top of the letterbox base. |
 | 3 | Run an Ultralytics parity benchmark on the frozen existing grouped folds using pretrained YOLO11n or YOLO26n. | Establish the target under matching fold inputs, image geometry, and project evaluation code. |
 | 4 | Add transfer learning to the custom architectures. Prefer architecture-compatible detection pretraining for the custom YOLO26 and a modern pretrained backbone for Faster R-CNN; document every imported weight source. | Compare pretrained custom models against their frozen scratch baselines and the parity benchmark. |
 | 5 | Freeze practical-model settings and report same-fold grouped-development results with an explicit selection-aligned limitation. | No candidate public-test use and no independent-generalization claim. |
@@ -112,7 +150,7 @@ For every practical experiment, append a row or section with:
 
 ## Immediate Next Steps
 
-1. Run one fixed post-submission grouped-CV letterbox baseline per architecture, using distinct run roots and no other setting changes.
-2. Compare each letterbox result with its matching historical stretch baseline; do not adopt letterbox unless the full three-fold result supports it.
-3. If letterbox is retained or its trade-off is documented, implement exactly one controlled Ultralytics-style train-only augmentation component with transform tests before beginning a full CV run.
-4. Do not introduce pretrained weights until the geometry and first augmentation component have a documented full-CV outcome.
+1. **Phase 1 complete:** Letterbox baseline established and adopted for both Custom YOLO26 and Custom Faster R-CNN on frozen 3-fold grouped development data.
+2. **Phase 2 (Augmentation Foundation):** Implement Component 1 of the train-only augmentation pipeline (HSV/photometric color jitter in training dataset loaders only, preserving bounding boxes and keeping validation strictly deterministic).
+3. Add unit tests in `tests/` verifying HSV transform bounds, seed reproducibility, and label/bounding box coordinate invariance.
+4. Run full 3-fold grouped CV for Custom YOLO26 and Custom Faster R-CNN with Component 1 on top of the adopted letterbox geometry before proceeding to geometric transforms (horizontal flip, random affine, mosaic).
