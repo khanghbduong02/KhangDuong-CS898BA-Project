@@ -151,6 +151,6 @@ For every practical experiment, append a row or section with:
 ## Immediate Next Steps
 
 1. **Phase 1 complete:** Letterbox baseline established and adopted for both Custom YOLO26 and Custom Faster R-CNN on frozen 3-fold grouped development data.
-2. **Phase 2 (Augmentation Foundation):** Implement Component 1 of the train-only augmentation pipeline (HSV/photometric color jitter in training dataset loaders only, preserving bounding boxes and keeping validation strictly deterministic).
-3. Add unit tests in `tests/` verifying HSV transform bounds, seed reproducibility, and label/bounding box coordinate invariance.
-4. Run full 3-fold grouped CV for Custom YOLO26 and Custom Faster R-CNN with Component 1 on top of the adopted letterbox geometry before proceeding to geometric transforms (horizontal flip, random affine, mosaic).
+2. **Phase 2 (Augmentation Foundation):** Component 1 is implemented: train-only Ultralytics-aligned HSV jitter (`h=0.015`, `s=0.70`, `v=0.40`) in both local dataset loaders, with deterministic validation and label/coordinate invariance tests.
+3. The portable full-CV training and validation commands for this component are recorded in [README.md](README.md#phase-2-train-only-hsv-augmentation).
+4. **Active experiment:** run full 3-fold grouped CV for Custom YOLO26 and Custom Faster R-CNN with Component 1 on the adopted letterbox base. Do not proceed to geometric transforms until those results are recorded and compared.

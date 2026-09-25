@@ -100,12 +100,73 @@ def test_photometric_datasets_preserve_detection_targets() -> None:
         assert not torch.equal(raw_image, augmented_image)
 
 
+def test_hsv_policy_is_deterministic_and_preserves_tensor_contract() -> None:
+    """The HSV policy changes color appearance only and stays within normalized RGB bounds."""
+    source = torch.linspace(0.05, 0.95, 3 * 8 * 8, dtype=torch.float32).reshape(3, 8, 8)
+    original = source.clone()
+
+    assert validate_online_augmentation("hsv") == "hsv"
+
+    torch.manual_seed(4321)
+    augmented = apply_online_augmentation(source, "hsv")
+    torch.manual_seed(4321)
+    repeated = apply_online_augmentation(source, "hsv")
+
+    assert torch.equal(source, original)
+    assert augmented.shape == source.shape
+    assert augmented.dtype == source.dtype
+    assert torch.isfinite(augmented).all()
+    assert 0.0 <= float(augmented.min()) <= float(augmented.max()) <= 1.0
+    assert not torch.equal(augmented, source)
+    assert torch.equal(augmented, repeated)
+
+
+def test_hsv_datasets_preserve_detection_targets() -> None:
+    """HSV training augmentation must not alter either detector's bounding boxes or labels."""
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        split_root = Path(temporary_directory) / "train"
+        _write_detection_split(split_root)
+
+        yolo_raw = YoloDetectionDataset(split_root, imgsz=32)
+        yolo_hsv = YoloDetectionDataset(
+            split_root,
+            imgsz=32,
+            online_augmentation="hsv",
+        )
+        raw_image, raw_labels = yolo_raw[0]
+        torch.manual_seed(7)
+        hsv_image, hsv_labels = yolo_hsv[0]
+        assert torch.equal(raw_labels, hsv_labels)
+        assert raw_image.shape == hsv_image.shape
+        assert not torch.equal(raw_image, hsv_image)
+
+        faster_raw = FasterRCNNDataset(split_root, imgsz=32, num_classes=2)
+        faster_hsv = FasterRCNNDataset(
+            split_root,
+            imgsz=32,
+            num_classes=2,
+            online_augmentation="hsv",
+        )
+        raw_image, raw_target = faster_raw[0]
+        torch.manual_seed(7)
+        hsv_image, hsv_target = faster_hsv[0]
+        assert torch.equal(raw_target["boxes"], hsv_target["boxes"])
+        assert torch.equal(raw_target["labels"], hsv_target["labels"])
+        assert raw_image.shape == hsv_image.shape
+        assert not torch.equal(raw_image, hsv_image)
+
+
 def main() -> None:
     test_photometric_policy_is_deterministic_and_preserves_tensor_contract()
     print("photometric_tensor_contract: passed")
     test_photometric_datasets_preserve_detection_targets()
     print("photometric_dataset_targets: passed")
+    test_hsv_policy_is_deterministic_and_preserves_tensor_contract()
+    print("hsv_tensor_contract: passed")
+    test_hsv_datasets_preserve_detection_targets()
+    print("hsv_dataset_targets: passed")
 
 
 if __name__ == "__main__":
     main()
+

@@ -206,6 +206,33 @@ The completed 3-fold grouped cross-validation evaluations under `runs/yolo26/pos
 - **Custom Faster R-CNN (scale `s`):** mAP50 preserved parity with the submitted scheduled scratch baseline at **$0.3280 \pm 0.0282$** (vs $0.3258 \pm 0.0275$), mAP50-95 was $0.1198 \pm 0.0097$, precision was $0.2985 \pm 0.1086$, and recall was $0.1167 \pm 0.0183$.
 - **Status:** Letterbox is adopted as the standardized geometry for subsequent practical-track development. Detailed metrics, per-class breakdowns, and roadmap phases are documented in [POST_SUBMISSION_PRACTICAL_PLAN.md](POST_SUBMISSION_PRACTICAL_PLAN.md) and [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md). Do not evaluate on the candidate public test split.
 
+### Phase 2 train-only HSV augmentation
+
+[online_augmentation.py](online_augmentation.py) provides three in-memory policies: `none`, the historical `photometric` policy, and `hsv`. The `hsv` policy follows the official Ultralytics default gains: hue `0.015` (fraction of 180 degrees), saturation `0.70`, and value `0.40`. It changes only normalized RGB pixels. It does not change image geometry, boxes, labels, source files, class counts, or validation behavior. Both custom trainers pass the selected policy only to their training datasets; validation always uses `none`. Checkpoints and CV compatibility checks store the policy.
+
+Run the controlled Phase 2 three-fold training first. These are Windows Command Prompt commands and assume the repository, `cv-data/roboflow-3d-print-fail-v1`, and the `3dprint-det` environment are available. Run the two training commands sequentially on one GPU.
+
+```bat
+cd /d "path\to\KhangDuong-CS898BA-Project"
+conda activate 3dprint-det
+python -m tests.test_online_augmentation
+python -m tests.test_image_geometry
+
+python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_hsv --epochs 50 --batch-size 8 --imgsz 960 --workers 0 --seed 42 --device cuda --scale n --focal-gamma 2 --class-positive-weight-power 0.25 --checkpoint-selection map50 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation hsv
+
+python run_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hsv --epochs 50 --batch-size 2 --imgsz 960 --workers 0 --seed 42 --device cuda --scale s --class-positive-weight-power 0.25 --checkpoint-selection map50 --lr-schedule cosine --warmup-epochs 3 --warmup-start-factor 0.1 --cosine-final-factor 0.02 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation hsv
+```
+
+After training finishes, run validation on the same computer that owns the checkpoints. The evaluators restore saved geometry and augmentation metadata; no augmentation is applied during evaluation.
+
+```bat
+python eval_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_hsv --imgsz 960 --batch-size 8 --workers 0 --device cuda --conf-thresh 0.25 --postprocess class_aware_nms --inference-branch one2many
+
+python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hsv --imgsz 960 --batch-size 2 --workers 0 --device cuda --conf-thresh 0.25 --nms-iou 0.70
+```
+
+Do not add `--force` unless an intentional full retrain is required. Do not use `--fraction` for the final experiment, and do not use candidate public-test data.
+
 ### Batch demonstration
 
 [demo_custom_yolo26.py](demo_custom_yolo26.py) creates annotated batch-inference images and a JSON prediction summary from the selected local custom YOLO26 checkpoint. It is intended for the recorded final demonstration, not cross-validation metric selection. It overlays white validation ground-truth boxes and colored custom-model predictions. Use grouped validation images rather than the excluded public candidate test split:

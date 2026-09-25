@@ -736,8 +736,9 @@ def parse_args() -> argparse.Namespace:
         choices=ONLINE_AUGMENTATION_CHOICES,
         default=DEFAULT_ONLINE_AUGMENTATION,
         help=(
-            "Training-only image augmentation; photometric applies conservative brightness, contrast, gamma, "
-            "and noise changes without changing boxes, labels, or source files"
+            "Training-only in-memory image augmentation: hsv applies Ultralytics-aligned "
+            "HSV jitter; photometric applies conservative brightness, contrast, gamma, and noise. "
+            "Validation always uses none; boxes, labels, and source files are unchanged"
         ),
     )
     parser.add_argument("--device", type=str, default="cuda", help="Training device, e.g. cuda or cuda:0")
