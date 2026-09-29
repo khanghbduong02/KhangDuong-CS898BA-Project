@@ -206,11 +206,43 @@ The completed 3-fold grouped cross-validation evaluations under `runs/yolo26/pos
 - **Custom Faster R-CNN (scale `s`):** mAP50 preserved parity with the submitted scheduled scratch baseline at **$0.3280 \pm 0.0282$** (vs $0.3258 \pm 0.0275$), mAP50-95 was $0.1198 \pm 0.0097$, precision was $0.2985 \pm 0.1086$, and recall was $0.1167 \pm 0.0183$.
 - **Status:** Letterbox is adopted as the standardized geometry for subsequent practical-track development. Detailed metrics, per-class breakdowns, and roadmap phases are documented in [POST_SUBMISSION_PRACTICAL_PLAN.md](POST_SUBMISSION_PRACTICAL_PLAN.md) and [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md). Do not evaluate on the candidate public test split.
 
-### Phase 2 train-only HSV augmentation
+### Phase 2 train-only HSV augmentation: implemented, evaluated, and rejected
 
 [online_augmentation.py](online_augmentation.py) provides three in-memory policies: `none`, the historical `photometric` policy, and `hsv`. The `hsv` policy follows the official Ultralytics default gains: hue `0.015` (fraction of 180 degrees), saturation `0.70`, and value `0.40`. It changes only normalized RGB pixels. It does not change image geometry, boxes, labels, source files, class counts, or validation behavior. Both custom trainers pass the selected policy only to their training datasets; validation always uses `none`. Checkpoints and CV compatibility checks store the policy.
 
-Run the controlled Phase 2 three-fold training first. These are Windows Command Prompt commands and assume the repository, `cv-data/roboflow-3d-print-fail-v1`, and the `3dprint-det` environment are available. Run the two training commands sequentially on one GPU.
+The controlled 3-fold grouped CV comparison of `post_submission_letterbox_hsv` against the adopted `post_submission_letterbox` base was completed. **HSV jitter was rejected for both models.**
+
+| Model | Metric | Letterbox base | Letterbox + HSV | Change |
+| --- | --- | ---: | ---: | ---: |
+| Custom YOLO26 `n` | mAP50 | $0.1985 \pm 0.0063$ | $0.1795 \pm 0.0229$ | $-0.0190$ |
+| Custom YOLO26 `n` | mAP50-95 | $0.0691 \pm 0.0053$ | $0.0610 \pm 0.0086$ | $-0.0081$ |
+| Custom YOLO26 `n` | Precision @ 0.25 | $0.1137 \pm 0.0073$ | $0.1255 \pm 0.0110$ | $+0.0118$ |
+| Custom YOLO26 `n` | Recall @ 0.25 | $0.1453 \pm 0.0139$ | $0.1563 \pm 0.0191$ | $+0.0110$ |
+| Custom Faster R-CNN `s` | mAP50 | $0.3280 \pm 0.0282$ | $0.3179 \pm 0.0188$ | $-0.0101$ |
+| Custom Faster R-CNN `s` | mAP50-95 | $0.1198 \pm 0.0097$ | $0.1162 \pm 0.0044$ | $-0.0036$ |
+| Custom Faster R-CNN `s` | Precision @ 0.25 | $0.2985 \pm 0.1086$ | $0.2483 \pm 0.0305$ | $-0.0502$ |
+| Custom Faster R-CNN `s` | Recall @ 0.25 | $0.1167 \pm 0.0183$ | $0.1344 \pm 0.0204$ | $+0.0177$ |
+
+Per-class mean AP50 (letterbox base to letterbox + HSV):
+
+| Class | YOLO26 base | YOLO26 + HSV | Faster R-CNN base | Faster R-CNN + HSV |
+| --- | ---: | ---: | ---: | ---: |
+| Spaghetti (id 0) | 0.0336 | **0.0466** | 0.0434 | **0.0507** |
+| Layer cracking (id 1) | **0.1510** | 0.1239 | **0.2694** | 0.2441 |
+| Over extrusion (id 2) | **0.3432** | 0.3134 | 0.5533 | **0.5761** |
+| Stringing (id 3) | **0.0884** | 0.0621 | **0.2352** | 0.1829 |
+| Warping (id 4) | **0.3763** | 0.3512 | **0.5384** | 0.5359 |
+
+Interpretation:
+
+- YOLO26 lost roughly 9.6% relative mAP50 and its fold-to-fold spread grew from $\pm 0.0063$ to $\pm 0.0229$, so the aggregate drop is also far less stable. Spaghetti AP50 improved, but the three rarer and more localized defect classes all declined.
+- Faster R-CNN lost about 3.1% relative mAP50, and the large precision drop with a recall gain indicates a score-calibration shift rather than a localization improvement.
+- Both losses came with equal-or-lower training-side loss diagnostics, so the effect is not a simple under-training artifact.
+- Decision: keep the letterbox-only configuration as the adopted training recipe. Retain the `hsv` policy in the codebase as a tested, documented negative result. Do not use it for the selected models.
+
+The run roots remain available for inspection: `runs/yolo26/post_submission_letterbox_hsv` and `runs/faster_rcnn/post_submission_letterbox_hsv`.
+
+The portable training and validation commands for the next component are recorded below and follow the same structure.
 
 ```bat
 cd /d "path\to\KhangDuong-CS898BA-Project"
@@ -218,17 +250,13 @@ conda activate 3dprint-det
 python -m tests.test_online_augmentation
 python -m tests.test_image_geometry
 
-python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_hsv --epochs 50 --batch-size 8 --imgsz 960 --workers 0 --seed 42 --device cuda --scale n --focal-gamma 2 --class-positive-weight-power 0.25 --checkpoint-selection map50 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation hsv
+python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox --epochs 50 --batch-size 8 --imgsz 960 --workers 0 --seed 42 --device cuda --scale n --focal-gamma 2 --class-positive-weight-power 0.25 --checkpoint-selection map50 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation none
 
-python run_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hsv --epochs 50 --batch-size 2 --imgsz 960 --workers 0 --seed 42 --device cuda --scale s --class-positive-weight-power 0.25 --checkpoint-selection map50 --lr-schedule cosine --warmup-epochs 3 --warmup-start-factor 0.1 --cosine-final-factor 0.02 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation hsv
-```
+python run_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox --epochs 50 --batch-size 2 --imgsz 960 --workers 0 --seed 42 --device cuda --scale s --class-positive-weight-power 0.25 --checkpoint-selection map50 --lr-schedule cosine --warmup-epochs 3 --warmup-start-factor 0.1 --cosine-final-factor 0.02 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation none
 
-After training finishes, run validation on the same computer that owns the checkpoints. The evaluators restore saved geometry and augmentation metadata; no augmentation is applied during evaluation.
+python eval_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox --imgsz 960 --batch-size 8 --workers 0 --device cuda --conf-thresh 0.25 --postprocess class_aware_nms --inference-branch one2many
 
-```bat
-python eval_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_hsv --imgsz 960 --batch-size 8 --workers 0 --device cuda --conf-thresh 0.25 --postprocess class_aware_nms --inference-branch one2many
-
-python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hsv --imgsz 960 --batch-size 2 --workers 0 --device cuda --conf-thresh 0.25 --nms-iou 0.70
+python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox --imgsz 960 --batch-size 2 --workers 0 --device cuda --conf-thresh 0.25 --nms-iou 0.70
 ```
 
 Do not add `--force` unless an intentional full retrain is required. Do not use `--fraction` for the final experiment, and do not use candidate public-test data.
