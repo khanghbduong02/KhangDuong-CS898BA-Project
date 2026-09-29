@@ -32,6 +32,8 @@ from online_augmentation import (
     DEFAULT_ONLINE_AUGMENTATION,
     ONLINE_AUGMENTATION_CHOICES,
     apply_online_augmentation,
+    augment_image,
+    flip_boxes_xyxy,
     validate_online_augmentation,
 )
 from training_control import (
@@ -174,7 +176,7 @@ class FasterRCNNDataset(Dataset):
             resize_mode=self.resize_mode,
         )
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
-        image_tensor = apply_online_augmentation(image_tensor, self.online_augmentation)
+        image_tensor, flipped = augment_image(image_tensor, self.online_augmentation)
 
         label_path = self.labels_dir / f"{image_path.stem}.txt"
         raw = read_yolo_label(label_path, self.num_classes)
@@ -183,6 +185,9 @@ class FasterRCNNDataset(Dataset):
 
         boxes_xyxy = converted[keep]
         labels = raw[:, 0].long()[keep] + 1
+
+        if flipped:
+            boxes_xyxy = flip_boxes_xyxy(boxes_xyxy, image_tensor.shape[-1])
 
         return image_tensor, {"boxes": boxes_xyxy, "labels": labels}
 

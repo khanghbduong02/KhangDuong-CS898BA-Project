@@ -30,6 +30,8 @@ from online_augmentation import (
     DEFAULT_ONLINE_AUGMENTATION,
     ONLINE_AUGMENTATION_CHOICES,
     apply_online_augmentation,
+    augment_image,
+    flip_yolo_cxcywh,
     validate_online_augmentation,
 )
 from training_control import (
@@ -120,7 +122,7 @@ class YoloDetectionDataset(Dataset):
             resize_mode=self.resize_mode,
         )
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
-        image_tensor = apply_online_augmentation(image_tensor, self.online_augmentation)
+        image_tensor, flipped = augment_image(image_tensor, self.online_augmentation)
 
         label_path = self.labels_dir / f"{image_path.stem}.txt"
         labels = []
@@ -152,7 +154,10 @@ class YoloDetectionDataset(Dataset):
             if labels
             else torch.zeros((0, 5), dtype=torch.float32)
         )
-        return image_tensor, source_yolo_to_model_yolo(labels_tensor, transform)
+        model_targets = source_yolo_to_model_yolo(labels_tensor, transform)
+        if flipped:
+            model_targets = flip_yolo_cxcywh(model_targets)
+        return image_tensor, model_targets
 
 
 def collate_fn(batch: Sequence[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, List[torch.Tensor]]:

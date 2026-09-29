@@ -1,9 +1,17 @@
-"""Conservative in-memory photometric augmentation for local detector training.
+"""Conservative in-memory augmentation for local detector training.
 
-This module deliberately changes pixel appearance only. It never changes image
-geometry, boxes, labels, source files, or class sampling frequencies.
+The photometric and hsv policies change pixel appearance only. They never change
+image geometry, boxes, labels, source files, or class sampling frequencies.
+
+The hflip policy is the first geometry-changing policy. It mirrors the image and
+transforms the model-space targets with the matching coordinate rule. Callers must
+use :func:`augment_image` and forward the returned ``flipped`` flag to
+:func:`flip_boxes_xyxy` or :func:`flip_yolo_cxcywh` so that boxes stay consistent
+with the mirrored image.
 """
 from __future__ import annotations
+
+from typing import Tuple
 
 import cv2
 import numpy as np
@@ -11,7 +19,12 @@ import torch
 
 
 DEFAULT_ONLINE_AUGMENTATION = "none"
-ONLINE_AUGMENTATION_CHOICES = ("none", "photometric", "hsv")
+ONLINE_AUGMENTATION_CHOICES = ("none", "photometric", "hsv", "hflip")
+
+# Official Ultralytics horizontal flip probability (fliplr in the default dataset config)
+DEFAULT_HFLIP_PROB = 0.5
+
+GEOMETRIC_ONLINE_AUGMENTATIONS = ("hflip",)
 
 PHOTOMETRIC_BRIGHTNESS_DELTA = 0.10
 PHOTOMETRIC_CONTRAST_DELTA = 0.10
@@ -83,6 +96,83 @@ def apply_hsv_augmentation(
     return result.clamp(0.0, 1.0)
 
 
+def apply_horizontal_flip(
+    image: torch.Tensor,
+    probability: float = DEFAULT_HFLIP_PROB,
+) -> Tuple[torch.Tensor, bool]:
+    """Mirror a normalized RGB tensor along the width axis with probability ``probability``.
+
+    Returns the (possibly mirrored) tensor and a flag telling the caller whether the
+    flip was actually applied. The decision uses torch random number generation so it
+    is reproducible under a fixed seed.
+    """
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("hflip probability must be in [0, 1]")
+
+    draw = torch.rand((), device=image.device)
+    if float(draw) >= probability:
+        return image, False
+    return image.flip(-1), True
+
+
+def flip_boxes_xyxy(boxes: torch.Tensor, width: int) -> torch.Tensor:
+    """Mirror absolute ``(N, 4)`` XYXY boxes across an image of the given width.
+
+    Uses the half-open pixel convention ``x' = width - x`` so that a box covering the
+    full image maps to itself and boxes keep a positive area.
+    """
+    if boxes.numel() == 0:
+        return boxes
+    if boxes.shape[-1] != 4:
+        raise ValueError(f"Expected (N, 4) XYXY boxes, got {tuple(boxes.shape)}")
+
+    mirrored = boxes.clone()
+    x1 = boxes[:, 0].clone()
+    x2 = boxes[:, 2].clone()
+    mirrored[:, 0] = float(width) - x2
+    mirrored[:, 2] = float(width) - x1
+    return mirrored
+
+
+def flip_yolo_cxcywh(boxes: torch.Tensor) -> torch.Tensor:
+    """Mirror normalized ``(N, 5)`` ``(class, cx, cy, w, h)`` YOLO targets.
+
+    Only the x center changes: ``cx' = 1 - cx``. Width, height, and class IDs are
+    unchanged, and the box stays inside the unit square.
+    """
+    if boxes.numel() == 0:
+        return boxes
+    if boxes.shape[-1] != 5:
+        raise ValueError(f"Expected (N, 5) YOLO targets, got {tuple(boxes.shape)}")
+
+    mirrored = boxes.clone()
+    mirrored[:, 1] = 1.0 - boxes[:, 1]
+    return mirrored
+
+
+def augment_image(image: torch.Tensor, mode: str) -> Tuple[torch.Tensor, bool]:
+    """Return an augmented copy of a normalized RGB tensor and a geometric-change flag.
+
+    ``image`` must have shape ``(3, height, width)`` with finite float values in
+    ``[0, 1]``. The flag is ``True`` only when the returned pixels are geometrically
+    mirrored relative to the input, so the caller knows whether targets must be
+    transformed. Appearance-only policies return ``False``.
+    """
+    mode = validate_online_augmentation(mode)
+    if image.ndim != 3 or image.shape[0] != 3:
+        raise ValueError(f"Expected a normalized RGB tensor with shape (3, height, width), got {tuple(image.shape)}")
+    if not image.is_floating_point():
+        raise ValueError("Online augmentation requires a floating-point image tensor")
+    if not torch.isfinite(image).all() or image.min() < 0.0 or image.max() > 1.0:
+        raise ValueError("Online augmentation requires finite image values in [0, 1]")
+    if mode == "none":
+        return image, False
+    if mode == "hflip":
+        return apply_horizontal_flip(image)
+
+    return apply_online_augmentation(image, mode), False
+
+
 def apply_online_augmentation(image: torch.Tensor, mode: str) -> torch.Tensor:
     """Return an appearance-only augmented copy of a normalized RGB tensor.
 
@@ -99,6 +189,11 @@ def apply_online_augmentation(image: torch.Tensor, mode: str) -> torch.Tensor:
         raise ValueError("Online augmentation requires finite image values in [0, 1]")
     if mode == "none":
         return image
+    if mode in GEOMETRIC_ONLINE_AUGMENTATIONS:
+        raise ValueError(
+            f"Online augmentation {mode!r} changes geometry, so it cannot be applied through this "
+            "appearance-only helper. Use augment_image() and transform the targets with the returned flag."
+        )
     if mode == "hsv":
         return apply_hsv_augmentation(image)
 

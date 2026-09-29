@@ -206,7 +206,36 @@ The completed 3-fold grouped cross-validation evaluations under `runs/yolo26/pos
 - **Custom Faster R-CNN (scale `s`):** mAP50 preserved parity with the submitted scheduled scratch baseline at **$0.3280 \pm 0.0282$** (vs $0.3258 \pm 0.0275$), mAP50-95 was $0.1198 \pm 0.0097$, precision was $0.2985 \pm 0.1086$, and recall was $0.1167 \pm 0.0183$.
 - **Status:** Letterbox is adopted as the standardized geometry for subsequent practical-track development. Detailed metrics, per-class breakdowns, and roadmap phases are documented in [POST_SUBMISSION_PRACTICAL_PLAN.md](POST_SUBMISSION_PRACTICAL_PLAN.md) and [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md). Do not evaluate on the candidate public test split.
 
-### Phase 2 train-only HSV augmentation: implemented, evaluated, and rejected
+#### Phase 2 Component 2 train-only horizontal flip (ready for controlled CV)
+
+`hflip` is the first geometry-changing online policy. [online_augmentation.py](online_augmentation.py) adds `apply_horizontal_flip` with the official Ultralytics `fliplr=0.5` probability, plus the matching target transforms `flip_boxes_xyxy` (`x' = width - x`, half-open pixel convention) and `flip_yolo_cxcywh` (`cx' = 1 - cx`).
+
+The design point that makes this safe: the appearance-only entry point `apply_online_augmentation` now **rejects** geometric policies, because it cannot keep targets consistent. Callers must use `augment_image`, which returns the augmented tensor together with a `flipped` flag, and then apply the matching box transform. Both trainers do this, so YOLO26 mirrors its normalized `cxcywh` targets and Faster R-CNN mirrors its absolute `xyxy` boxes. Class IDs are never changed. Validation still uses `none`, so evaluation stays strictly deterministic. Source files on disk are never modified.
+
+Verified by nine passing checks in [tests/test_online_augmentation.py](tests/test_online_augmentation.py), including box-mirror correctness, full-width box invariance, positive-area preservation, empty-target handling, malformed-shape rejection, seed reproducibility at probability 0.0/0.5/1.0, dataset pixel/target alignment for both architectures, and byte-identical reads under identical seeds. The existing image-geometry suite also still passes, and both K-fold runners accept `--online-augmentation hflip` in a dry run.
+
+This is a completed code and test foundation. No hflip training result is claimed yet.
+
+The portable training and validation commands for this component are:
+
+```bat
+cd /d "path\to\KhangDuong-CS898BA-Project"
+conda activate 3dprint-det
+python -m tests.test_online_augmentation
+python -m tests.test_image_geometry
+
+python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_hflip --epochs 50 --batch-size 8 --imgsz 960 --workers 0 --seed 42 --device cuda --scale n --focal-gamma 2 --class-positive-weight-power 0.25 --checkpoint-selection map50 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation hflip
+
+python run_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip --epochs 50 --batch-size 2 --imgsz 960 --workers 0 --seed 42 --device cuda --scale s --class-positive-weight-power 0.25 --checkpoint-selection map50 --lr-schedule cosine --warmup-epochs 3 --warmup-start-factor 0.1 --cosine-final-factor 0.02 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation hflip
+
+python eval_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_hflip --imgsz 960 --batch-size 8 --workers 0 --device cuda --conf-thresh 0.25 --postprocess class_aware_nms --inference-branch one2many
+
+python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip --imgsz 960 --batch-size 2 --workers 0 --device cuda --conf-thresh 0.25 --nms-iou 0.70
+```
+
+Run the two training commands sequentially on one GPU, and evaluate on the machine that owns the checkpoints. Do not add `--force`, do not use `--fraction`, and do not use candidate public-test data.
+
+## Phase 2 train-only HSV augmentation: implemented, evaluated, and rejected
 
 [online_augmentation.py](online_augmentation.py) provides three in-memory policies: `none`, the historical `photometric` policy, and `hsv`. The `hsv` policy follows the official Ultralytics default gains: hue `0.015` (fraction of 180 degrees), saturation `0.70`, and value `0.40`. It changes only normalized RGB pixels. It does not change image geometry, boxes, labels, source files, class counts, or validation behavior. Both custom trainers pass the selected policy only to their training datasets; validation always uses `none`. Checkpoints and CV compatibility checks store the policy.
 
