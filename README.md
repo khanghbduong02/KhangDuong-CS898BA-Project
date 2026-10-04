@@ -206,34 +206,58 @@ The completed 3-fold grouped cross-validation evaluations under `runs/yolo26/pos
 - **Custom Faster R-CNN (scale `s`):** mAP50 preserved parity with the submitted scheduled scratch baseline at **$0.3280 \pm 0.0282$** (vs $0.3258 \pm 0.0275$), mAP50-95 was $0.1198 \pm 0.0097$, precision was $0.2985 \pm 0.1086$, and recall was $0.1167 \pm 0.0183$.
 - **Status:** Letterbox is adopted as the standardized geometry for subsequent practical-track development. Detailed metrics, per-class breakdowns, and roadmap phases are documented in [POST_SUBMISSION_PRACTICAL_PLAN.md](POST_SUBMISSION_PRACTICAL_PLAN.md) and [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md). Do not evaluate on the candidate public test split.
 
-#### Phase 2 Component 2 train-only horizontal flip (ready for controlled CV)
+#### Phase 2 Component 2 train-only horizontal flip: evaluated, split verdict
 
 `hflip` is the first geometry-changing online policy. [online_augmentation.py](online_augmentation.py) adds `apply_horizontal_flip` with the official Ultralytics `fliplr=0.5` probability, plus the matching target transforms `flip_boxes_xyxy` (`x' = width - x`, half-open pixel convention) and `flip_yolo_cxcywh` (`cx' = 1 - cx`).
 
 The design point that makes this safe: the appearance-only entry point `apply_online_augmentation` now **rejects** geometric policies, because it cannot keep targets consistent. Callers must use `augment_image`, which returns the augmented tensor together with a `flipped` flag, and then apply the matching box transform. Both trainers do this, so YOLO26 mirrors its normalized `cxcywh` targets and Faster R-CNN mirrors its absolute `xyxy` boxes. Class IDs are never changed. Validation still uses `none`, so evaluation stays strictly deterministic. Source files on disk are never modified.
 
-Verified by nine passing checks in [tests/test_online_augmentation.py](tests/test_online_augmentation.py), including box-mirror correctness, full-width box invariance, positive-area preservation, empty-target handling, malformed-shape rejection, seed reproducibility at probability 0.0/0.5/1.0, dataset pixel/target alignment for both architectures, and byte-identical reads under identical seeds. The existing image-geometry suite also still passes, and both K-fold runners accept `--online-augmentation hflip` in a dry run.
+The controlled 3-fold comparison produced **opposite verdicts for the two architectures**.
 
-This is a completed code and test foundation. No hflip training result is claimed yet.
+| Model | Metric | Letterbox base | Letterbox + hflip | Change |
+| --- | --- | ---: | ---: | ---: |
+| Custom YOLO26 `n` | mAP50 | $0.1985 \pm 0.0063$ | $0.1890 \pm 0.0190$ | $-0.0095$ |
+| Custom YOLO26 `n` | mAP50-95 | $0.0691 \pm 0.0053$ | $0.0662 \pm 0.0097$ | $-0.0029$ |
+| Custom YOLO26 `n` | Precision @ 0.25 | $0.1137 \pm 0.0073$ | $0.1497 \pm 0.0285$ | $+0.0360$ |
+| Custom YOLO26 `n` | Recall @ 0.25 | $0.1453 \pm 0.0139$ | $0.1401 \pm 0.0074$ | $-0.0052$ |
+| Custom Faster R-CNN `s` | mAP50 | $0.3280 \pm 0.0282$ | $\mathbf{0.3394 \pm 0.0326}$ | $+0.0114$ |
+| Custom Faster R-CNN `s` | mAP50-95 | $0.1198 \pm 0.0097$ | $\mathbf{0.1343 \pm 0.0188}$ | $+0.0145$ |
+| Custom Faster R-CNN `s` | Precision @ 0.25 | $0.2985 \pm 0.1086$ | $0.2132 \pm 0.0201$ | $-0.0853$ |
+| Custom Faster R-CNN `s` | Recall @ 0.25 | $0.1167 \pm 0.0183$ | $\mathbf{0.1610 \pm 0.0175}$ | $+0.0443$ |
 
-The portable training and validation commands for this component are:
+Per-class mean AP50 (letterbox base to letterbox + hflip):
+
+| Class | YOLO26 base | YOLO26 + hflip | Faster R-CNN base | Faster R-CNN + hflip |
+| --- | ---: | ---: | ---: | ---: |
+| Spaghetti (id 0) | 0.0336 | **0.0567** | 0.0434 | **0.0599** |
+| Layer cracking (id 1) | **0.1510** | 0.1169 | **0.2694** | 0.2603 |
+| Over extrusion (id 2) | **0.3432** | 0.3393 | 0.5533 | **0.5799** |
+| Stringing (id 3) | 0.0884 | **0.1339** | 0.2352 | **0.2437** |
+| Warping (id 4) | **0.3763** | 0.2982 | 0.5384 | **0.5532** |
+
+Interpretation:
+
+- **Faster R-CNN: adopt hflip.** mAP50 rose $+0.0114$ and mAP50-95 rose $+0.0145$ (a larger relative gain than the base run, about $+12\%$). The gain is broad: four of five classes improved, spaghetti rose $0.0434 \rightarrow 0.0599$, stringing $0.2352 \rightarrow 0.2437$, over extrusion $0.5533 \rightarrow 0.5799$, and warping $0.5384 \rightarrow 0.5532$. The large precision drop with a large recall gain indicates better score calibration, not worse ranking, which is consistent with the mAP improvements. The honest caveat is that the mAP50-95 sample SD grew from $\pm 0.0097$ to $\pm 0.0188$, so with only three folds this is promising rather than decisive.
+- **YOLO26: reject hflip.** mAP50 fell $-0.0095$ and mAP50-95 fell $-0.0029$, with fold spread widening from $\pm 0.0063$ to $\pm 0.0190$. Spaghetti improved substantially ($0.0336 \rightarrow 0.0567$) and stringing improved ($0.0884 \rightarrow 0.1339$), but the gains did not offset declines in layer cracking ($-0.0341$), warping ($-0.0781$), and over extrusion. Precision rose sharply while recall fell, so the aggregate loss is driven by lost coverage on the harder localized defects.
+- The two models disagree because the two-stage Faster R-CNN proposal head benefits from left-right variety, while the single-stage YOLO26 at this scale appears to already be data-limited on rare classes, where mirroring effectively halves the distinct orientations available per defect type.
+
+Decisions:
+
+- Faster R-CNN is trained with `--online-augmentation hflip`.
+- YOLO26 remains trained with `--online-augmentation none` on the letterbox base.
+- Do not combine hflip with the rejected HSV policy; it stays a documented negative result.
+
+Run roots for inspection: `runs/yolo26/post_submission_letterbox_hflip` and `runs/faster_rcnn/post_submission_letterbox_hflip`.
+
+The portable commands used for this component were:
 
 ```bat
-cd /d "path\to\KhangDuong-CS898BA-Project"
-conda activate 3dprint-det
-python -m tests.test_online_augmentation
-python -m tests.test_image_geometry
-
 python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_hflip --epochs 50 --batch-size 8 --imgsz 960 --workers 0 --seed 42 --device cuda --scale n --focal-gamma 2 --class-positive-weight-power 0.25 --checkpoint-selection map50 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation hflip
 
 python run_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip --epochs 50 --batch-size 2 --imgsz 960 --workers 0 --seed 42 --device cuda --scale s --class-positive-weight-power 0.25 --checkpoint-selection map50 --lr-schedule cosine --warmup-epochs 3 --warmup-start-factor 0.1 --cosine-final-factor 0.02 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation hflip
-
-python eval_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_hflip --imgsz 960 --batch-size 8 --workers 0 --device cuda --conf-thresh 0.25 --postprocess class_aware_nms --inference-branch one2many
-
-python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip --imgsz 960 --batch-size 2 --workers 0 --device cuda --conf-thresh 0.25 --nms-iou 0.70
 ```
 
-Run the two training commands sequentially on one GPU, and evaluate on the machine that owns the checkpoints. Do not add `--force`, do not use `--fraction`, and do not use candidate public-test data.
+The nine deterministic checks in [tests/test_online_augmentation.py](tests/test_online_augmentation.py) covering box-mirror correctness, full-width box invariance, positive-area preservation, empty targets, malformed-shape rejection, seed reproducibility, dataset pixel/target alignment, and byte-identical repeat reads all pass, and the image-geometry suite still passes.
 
 ## Phase 2 train-only HSV augmentation: implemented, evaluated, and rejected
 
