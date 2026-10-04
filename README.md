@@ -206,7 +206,53 @@ The completed 3-fold grouped cross-validation evaluations under `runs/yolo26/pos
 - **Custom Faster R-CNN (scale `s`):** mAP50 preserved parity with the submitted scheduled scratch baseline at **$0.3280 \pm 0.0282$** (vs $0.3258 \pm 0.0275$), mAP50-95 was $0.1198 \pm 0.0097$, precision was $0.2985 \pm 0.1086$, and recall was $0.1167 \pm 0.0183$.
 - **Status:** Letterbox is adopted as the standardized geometry for subsequent practical-track development. Detailed metrics, per-class breakdowns, and roadmap phases are documented in [POST_SUBMISSION_PRACTICAL_PLAN.md](POST_SUBMISSION_PRACTICAL_PLAN.md) and [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md). Do not evaluate on the candidate public test split.
 
-#### Phase 2 Component 2 train-only horizontal flip: evaluated, split verdict
+#### Phase 2 Component 3 train-only random affine (ready for controlled CV)
+
+`affine` extends the geometric pipeline from a mirror to a general 2D warp. [online_augmentation.py](online_augmentation.py) adds `sample_affine_matrix`, `apply_affine`, and the target transforms `transform_boxes_xyxy` and `transform_yolo_cxcywh`.
+
+**Refactor that made this safe.** The previous contract returned a bare `flipped` boolean, which cannot express an arbitrary warp. `augment_image` now returns the image together with a 3×3 forward matrix mapping source pixels to destination pixels, and is the identity for appearance-only policies. The appearance-only helper `apply_online_augmentation` still rejects geometric policies, so targets can never silently desync from pixels.
+
+**Box handling.** Boxes are mapped by transforming all four corners and taking the axis-aligned envelope, which is the correct behaviour for a rotated box. Results are clipped to the image, and boxes that become degenerate or shrink below 1% of their original area are dropped with a keep-mask that both trainers apply to boxes and labels together, so the two can never drift out of length.
+
+**Deliberately gentle defaults**, smaller than the Ultralytics defaults (`degrees=0.0`, `translate=0.1`, `scale=0.5`) because this dataset is small and the rare defect classes are already fragile:
+
+| Parameter | Value |
+| --- | ---: |
+| `degrees` | ±5.0 |
+| `translate` | ±0.05 |
+| `scale` | ±0.10 |
+| `shear` | 0.0 |
+| probability | 0.5 |
+| border fill | 114 (mid-gray) |
+
+Rotation, scaling, and shearing are composed about the image centre. Regions rotated out of view are padded with mid-gray, matching Ultralytics.
+
+**Three real bugs were found and fixed by the tests during development**, all of which would have silently corrupted labels:
+
+1. `horizontal_flip_matrix` produced a *translation* (`x' = x + width`) instead of a *reflection* (`x' = -x + width`), which would have destroyed full-width boxes. There is now a dedicated regression test asserting the sign of the x scale term and that flipping twice returns the identity.
+2. `transform_yolo_cxcywh` did not apply its keep-mask to the transformed rows, producing a shape mismatch when boxes were dropped.
+3. `transform_yolo_cxcywh` returned half-extents instead of full extents, silently halving every box width and height.
+
+Fifteen deterministic checks now pass in [tests/test_online_augmentation.py](tests/test_online_augmentation.py), covering matrix identity and centre preservation, translation behaviour, scale sampling, box clipping and degenerate filtering, rotation envelope growth, normalized-range and class preservation for YOLO targets, mid-gray padding, seed reproducibility, and dataset pixel/target alignment for both architectures. The image-geometry suite still passes, and both K-fold runners accept `--online-augmentation affine` in a dry run.
+
+This is a completed code and test foundation. No affine training result is claimed yet.
+
+Run one architecture at a time, each against its own current best recipe. Faster R-CNN stacks on its adopted hflip recipe; YOLO26 stays on the letterbox-only recipe because it rejected hflip.
+
+```bat
+cd /d "path\to\KhangDuong-CS898BA-Project"
+conda activate 3dprint-det
+python -m tests.test_online_augmentation
+python -m tests.test_image_geometry
+
+python run_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip_affine --epochs 50 --batch-size 2 --imgsz 960 --workers 0 --seed 42 --device cuda --scale s --class-positive-weight-power 0.25 --checkpoint-selection map50 --lr-schedule cosine --warmup-epochs 3 --warmup-start-factor 0.1 --cosine-final-factor 0.02 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation affine
+
+python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_affine --epochs 50 --batch-size 8 --imgsz 960 --workers 0 --seed 42 --device cuda --scale n --focal-gamma 2 --class-positive-weight-power 0.25 --checkpoint-selection map50 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation affine
+```
+
+If stacking affine on hflip is adopted for Faster R-CNN, add a combined `hflip_affine` policy rather than chaining flags. Evaluate on the machine that owns the checkpoints. Do not add `--force`, do not use `--fraction`, and do not use candidate public-test data.
+
+### Phase 2 Component 2 train-only horizontal flip: evaluated, split verdict
 
 `hflip` is the first geometry-changing online policy. [online_augmentation.py](online_augmentation.py) adds `apply_horizontal_flip` with the official Ultralytics `fliplr=0.5` probability, plus the matching target transforms `flip_boxes_xyxy` (`x' = width - x`, half-open pixel convention) and `flip_yolo_cxcywh` (`cx' = 1 - cx`).
 

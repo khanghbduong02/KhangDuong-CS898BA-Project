@@ -31,7 +31,7 @@ from online_augmentation import (
     ONLINE_AUGMENTATION_CHOICES,
     apply_online_augmentation,
     augment_image,
-    flip_yolo_cxcywh,
+    transform_yolo_cxcywh,
     validate_online_augmentation,
 )
 from training_control import (
@@ -122,7 +122,7 @@ class YoloDetectionDataset(Dataset):
             resize_mode=self.resize_mode,
         )
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
-        image_tensor, flipped = augment_image(image_tensor, self.online_augmentation)
+        image_tensor, target_matrix = augment_image(image_tensor, self.online_augmentation)
 
         label_path = self.labels_dir / f"{image_path.stem}.txt"
         labels = []
@@ -155,8 +155,12 @@ class YoloDetectionDataset(Dataset):
             else torch.zeros((0, 5), dtype=torch.float32)
         )
         model_targets = source_yolo_to_model_yolo(labels_tensor, transform)
-        if flipped:
-            model_targets = flip_yolo_cxcywh(model_targets)
+        model_targets, _ = transform_yolo_cxcywh(
+            model_targets,
+            target_matrix,
+            int(image_tensor.shape[-2]),
+            int(image_tensor.shape[-1]),
+        )
         return image_tensor, model_targets
 
 

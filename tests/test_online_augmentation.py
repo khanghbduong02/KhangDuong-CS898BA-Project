@@ -8,13 +8,21 @@ import numpy as np
 import torch
 
 from online_augmentation import (
+    AFFINE_BORDER_VALUE,
+    DEFAULT_AFFINE_DEGREES,
     DEFAULT_HFLIP_PROB,
     DEFAULT_ONLINE_AUGMENTATION,
+    apply_affine,
     apply_horizontal_flip,
     apply_online_augmentation,
     augment_image,
     flip_boxes_xyxy,
     flip_yolo_cxcywh,
+    horizontal_flip_matrix,
+    identity_matrix,
+    sample_affine_matrix,
+    transform_boxes_xyxy,
+    transform_yolo_cxcywh,
     validate_online_augmentation,
 )
 from train_faster_rcnn import FasterRCNNDataset
@@ -243,31 +251,36 @@ def test_hflip_policy_is_reproducible_and_respects_probability() -> None:
             raise AssertionError("Expected ValueError for an out-of-range probability")
 
 
-def test_augment_image_reports_geometry_changes_only_for_hflip() -> None:
-    """The entry point flags geometric changes so callers can transform targets."""
+def test_augment_image_returns_identity_matrix_for_appearance_policies() -> None:
+    """Appearance-only policies must report an identity target transform."""
     source = torch.rand(3, 8, 8)
 
-    image, flipped = augment_image(source, "none")
-    assert flipped is False
+    image, matrix = augment_image(source, "none")
     assert torch.equal(image, source)
+    assert torch.equal(matrix, identity_matrix())
 
     torch.manual_seed(3)
-    hsv_image, hsv_flipped = augment_image(source, "hsv")
-    assert hsv_flipped is False
+    hsv_image, hsv_matrix = augment_image(source, "hsv")
     assert hsv_image.shape == source.shape
+    assert torch.equal(hsv_matrix, identity_matrix())
 
     torch.manual_seed(3)
-    flip_image, flip_flipped = augment_image(source, "hflip")
-    assert flip_flipped is True
-    assert torch.equal(flip_image, source.flip(-1))
+    flip_image, flip_matrix = augment_image(source, "hflip")
+    flipped = not torch.equal(flip_matrix, identity_matrix())
+    if flipped:
+        assert torch.equal(flip_matrix, horizontal_flip_matrix(8))
+        assert torch.equal(flip_image, source.flip(-1))
+    else:
+        assert torch.equal(flip_image, source)
 
     # The appearance-only helper must refuse policies it cannot keep consistent.
-    try:
-        apply_online_augmentation(source, "hflip")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("Expected the appearance-only helper to reject hflip")
+    for policy in ("hflip", "affine"):
+        try:
+            apply_online_augmentation(source, policy)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected the appearance-only helper to reject {policy}")
 
     try:
         augment_image(torch.randint(0, 2, (3, 8, 8)), "hflip")
@@ -351,17 +364,275 @@ def test_hflip_datasets_are_reproducible_across_identical_seeds() -> None:
         assert torch.equal(plain_target["boxes"], repeat_target["boxes"])
 
 
+def test_affine_matrix_maps_the_image_centre_to_itself() -> None:
+    """A zero-parameter affine must be the identity, and the centre must be preserved."""
+    height, width = 64, 48
+
+    torch.manual_seed(11)
+    identity = sample_affine_matrix(height, width, 0.0, 0.0, 0.0, 0.0)
+    assert torch.allclose(identity, identity_matrix(), atol=1e-6)
+
+    torch.manual_seed(11)
+    matrix = sample_affine_matrix(height, width, translate=0.0)
+    centre = torch.tensor([[width / 2.0, height / 2.0, 1.0]], dtype=torch.float32)
+    # With no translation, rotation and scale are applied about the centre.
+    assert torch.allclose((matrix @ centre.T).T, centre, atol=1e-3)
+
+    # A sampled translation must move the centre by exactly that offset.
+    torch.manual_seed(11)
+    shifted = sample_affine_matrix(height, width, degrees=0.0, scale=0.0, shear=0.0)
+    moved = (shifted @ centre.T).T
+    assert torch.allclose(moved[:, :2], centre[:, :2] + shifted[:2, 2], atol=1e-3)
+
+    # Scale-only sampling changes the box size by roughly the sampled factor.
+    torch.manual_seed(5)
+    scale_m = sample_affine_matrix(100, 100, 0.0, 0.0, 0.2, 0.0)
+    factor = float(scale_m[0, 0])
+    assert 0.8 <= factor <= 1.2
+    assert abs(float(scale_m[0, 1])) < 1e-6
+
+    for bad in ((-1.0, 0.05, 0.1, 0.0), (5.0, 1.5, 0.1, 0.0), (5.0, 0.05, 1.5, 0.0)):
+        try:
+            sample_affine_matrix(64, 64, *bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected ValueError for affine parameters {bad}")
+
+
+def test_affine_box_transform_clips_and_filters_degenerate_boxes() -> None:
+    """Boxes must move with the pixels, stay inside the frame, and drop degenerates."""
+    height, width = 64, 64
+    boxes = torch.tensor(
+        [[8.0, 8.0, 24.0, 24.0], [0.0, 0.0, 4.0, 4.0], [30.0, 30.0, 62.0, 62.0]],
+        dtype=torch.float32,
+    )
+
+    unchanged, identity_keep = transform_boxes_xyxy(
+        boxes, identity_matrix(), height, width
+    )
+    assert torch.allclose(unchanged, boxes, atol=1e-4)
+    assert bool(identity_keep.all())
+
+    # A large translation drops the boxes that leave the frame entirely.
+    shift = identity_matrix()
+    shift[0, 2] = -30.0
+    shifted, keep = transform_boxes_xyxy(boxes, shift, height, width)
+    assert shifted.shape == boxes.shape
+    for index in range(boxes.shape[0]):
+        if bool(keep[index]):
+            assert shifted[index][2] > shifted[index][0]
+            assert float(shifted[index][0]) >= 0.0
+            assert float(shifted[index][2]) <= width
+        else:
+            # A dropped box is degenerate after clipping.
+            assert not (shifted[index][2] > shifted[index][0])
+
+    # The centre box moves fully off frame, so it must be dropped.
+    assert bool(keep[0]) is False
+
+    # A smaller translation keeps the central box and still clips it in frame.
+    nudge = identity_matrix()
+    nudge[0, 2] = -5.0
+    nudged, nudge_keep = transform_boxes_xyxy(boxes, nudge, height, width)
+    assert bool(nudge_keep[0])
+    assert float(nudged[0][0]) >= 0.0
+    assert float(nudged[0][2]) <= width
+
+    for seed in range(6):
+        torch.manual_seed(seed)
+        matrix = sample_affine_matrix(height, width)
+        out, mask = transform_boxes_xyxy(boxes, matrix, height, width)
+        assert mask.shape == (3,)
+        if bool(mask.any()):
+            kept = out[mask]
+            assert float(kept[:, 0].min()) >= 0.0
+            assert float(kept[:, 1].min()) >= 0.0
+            assert float(kept[:, 2].max()) <= width
+            assert float(kept[:, 3].max()) <= height
+            assert (kept[:, 2] > kept[:, 0]).all()
+            assert (kept[:, 3] > kept[:, 1]).all()
+
+    # Rotation grows the axis-aligned envelope, which is the correct behaviour.
+    torch.manual_seed(2)
+    rotated = sample_affine_matrix(
+        height, width, degrees=45.0, translate=0.0, scale=0.0, shear=0.0
+    )
+    rotated_out, _ = transform_boxes_xyxy(boxes, rotated, height, width)
+    original_width = float(boxes[2, 2] - boxes[2, 0])
+    assert float(rotated_out[2, 2] - rotated_out[2, 0]) >= original_width - 1e-3
+
+    empty = torch.zeros((0, 4), dtype=torch.float32)
+    out, mask = transform_boxes_xyxy(empty, identity_matrix(), height, width)
+    assert out.shape == (0, 4) and mask.shape == (0,)
+
+
+def test_affine_yolo_targets_stay_normalized_and_preserve_classes() -> None:
+    """Normalized targets must survive the matrix transform inside the unit square."""
+    height, width = 64, 64
+    targets = torch.tensor(
+        [[0.0, 0.5, 0.5, 0.4, 0.4], [3.0, 0.2, 0.8, 0.1, 0.1]], dtype=torch.float32
+    )
+
+    unchanged, keep = transform_yolo_cxcywh(
+        targets, identity_matrix(), height, width
+    )
+    assert torch.allclose(unchanged, targets, atol=1e-4)
+    assert bool(keep.all())
+
+    for seed in range(6):
+        torch.manual_seed(seed)
+        matrix = sample_affine_matrix(height, width)
+        out, mask = transform_yolo_cxcywh(targets, matrix, height, width)
+        assert mask.shape == (2,)
+        if bool(mask.any()):
+            kept = out[mask]
+            assert (kept[:, 1] >= 0.0).all() and (kept[:, 1] <= 1.0).all()
+            assert (kept[:, 2] >= 0.0).all() and (kept[:, 2] <= 1.0).all()
+            assert (kept[:, 3] > 0.0).all() and (kept[:, 4] > 0.0).all()
+            assert torch.equal(kept[:, 0], targets[mask][:, 0])
+
+    empty = torch.zeros((0, 5), dtype=torch.float32)
+    out, mask = transform_yolo_cxcywh(empty, identity_matrix(), height, width)
+    assert out.shape == (0, 5) and mask.shape == (0,)
+
+
+def test_affine_warp_is_reproducible_and_stays_in_range() -> None:
+    """The warp must honour its probability and keep normalized RGB bounds."""
+    assert validate_online_augmentation("affine") == "affine"
+    assert 0.0 < DEFAULT_AFFINE_DEGREES <= 90.0
+
+    image = torch.rand(3, 32, 32)
+
+    torch.manual_seed(7)
+    warped, matrix = augment_image(image, "affine")
+    assert warped.shape == image.shape
+    assert torch.isfinite(warped).all()
+    assert float(warped.min()) >= 0.0 and float(warped.max()) <= 1.0
+
+    torch.manual_seed(7)
+    repeated, repeated_matrix = augment_image(image, "affine")
+    assert torch.equal(warped, repeated)
+    assert torch.equal(matrix, repeated_matrix)
+
+    # A forced translation must still return a valid matrix and in-range pixels.
+    white = torch.ones(3, 32, 32)
+    padded, padded_matrix = apply_affine(white, probability=1.0, translate=0.45, scale=0.0)
+    assert padded.shape == white.shape
+    assert padded_matrix.shape == (3, 3)
+    assert float(padded.min()) >= 0.0 and float(padded.max()) <= 1.0
+
+    # Regions translated out of view are padded with mid-gray, matching Ultralytics.
+    gray = AFFINE_BORDER_VALUE / 255.0
+    assert gray < 1.0
+    assert abs(float(padded.min()) - gray) < 0.02
+
+    try:
+        apply_affine(image, probability=1.5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Expected ValueError for an out-of-range probability")
+
+
+def test_affine_datasets_keep_targets_aligned_and_are_reproducible() -> None:
+    """Both trainers must return in-range targets that line up with the warped pixels."""
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        split_root = Path(temporary_directory) / "train"
+        _write_detection_split(split_root)
+
+        plain_yolo = YoloDetectionDataset(split_root, imgsz=32)
+        plain_image, plain_labels = plain_yolo[0]
+        plain_classes = set(plain_labels[:, 0].tolist())
+        yolo_affine = YoloDetectionDataset(
+            split_root, imgsz=32, online_augmentation="affine"
+        )
+        faster_affine = FasterRCNNDataset(
+            split_root, imgsz=32, num_classes=2, online_augmentation="affine"
+        )
+
+        for seed in range(6):
+            torch.manual_seed(seed)
+            image, labels = yolo_affine[0]
+            assert image.shape == plain_image.shape
+            assert torch.isfinite(image).all()
+            assert float(image.min()) >= 0.0 and float(image.max()) <= 1.0
+            if labels.numel():
+                assert (labels[:, 1] >= 0.0).all() and (labels[:, 1] <= 1.0).all()
+                assert (labels[:, 2] >= 0.0).all() and (labels[:, 2] <= 1.0).all()
+                assert (labels[:, 3] > 0.0).all() and (labels[:, 4] > 0.0).all()
+                # Class IDs are never invented or remapped.
+                assert set(labels[:, 0].tolist()).issubset(plain_classes)
+
+            torch.manual_seed(seed)
+            faster_image, faster_target = faster_affine[0]
+            assert faster_image.shape == plain_image.shape
+            boxes = faster_target["boxes"]
+            if boxes.numel():
+                assert float(boxes[:, 0].min()) >= 0.0
+                assert float(boxes[:, 1].min()) >= 0.0
+                assert float(boxes[:, 2].max()) <= 32
+                assert float(boxes[:, 3].max()) <= 32
+                assert (boxes[:, 2] > boxes[:, 0]).all()
+                assert (boxes[:, 3] > boxes[:, 1]).all()
+            # Boxes and labels always stay the same length after filtering.
+            assert boxes.shape[0] == faster_target["labels"].shape[0]
+
+        torch.manual_seed(31)
+        first_image, first_labels = yolo_affine[0]
+        torch.manual_seed(31)
+        second_image, second_labels = yolo_affine[0]
+        assert torch.equal(first_image, second_image)
+        assert torch.equal(first_labels, second_labels)
+
+
+def test_flip_matrix_is_a_reflection_not_a_translation() -> None:
+    """Regression: the flip matrix must mirror, and must round-trip to the identity."""
+    width, height = 32, 24
+    matrix = horizontal_flip_matrix(width)
+    # A true reflection flips the sign of the x scale term.
+    assert float(matrix[0, 0]) == -1.0
+    assert float(matrix[1, 1]) == 1.0
+
+    corners = torch.tensor([[0.0, 0.0, 1.0], [31.0, 0.0, 1.0]], dtype=torch.float32)
+    mapped = (matrix @ corners.T).T
+    assert torch.allclose(mapped[0], torch.tensor([32.0, 0.0, 1.0]))
+    assert torch.allclose(mapped[1], torch.tensor([1.0, 0.0, 1.0]))
+
+    # A full-width box must map onto itself through the generic matrix path.
+    full = torch.tensor([[0.0, 2.0, 32.0, 10.0]], dtype=torch.float32)
+    out, keep = transform_boxes_xyxy(full, matrix, height, width)
+    assert torch.allclose(out, full, atol=1e-4)
+    assert bool(keep.all())
+
+    # Flipping twice must be the identity.
+    squared = matrix @ matrix
+    assert torch.allclose(squared, identity_matrix(), atol=1e-6)
+
+
 def main() -> None:
     test_flip_targets_match_the_mirrored_image()
     print("flip_target_geometry: passed")
     test_hflip_policy_is_reproducible_and_respects_probability()
     print("hflip_probability_and_seed: passed")
-    test_augment_image_reports_geometry_changes_only_for_hflip()
-    print("augment_image_geometry_flag: passed")
+    test_augment_image_returns_identity_matrix_for_appearance_policies()
+    print("augment_image_identity_matrix: passed")
     test_hflip_datasets_keep_targets_aligned_with_pixels()
     print("hflip_dataset_alignment: passed")
     test_hflip_datasets_are_reproducible_across_identical_seeds()
     print("hflip_dataset_reproducibility: passed")
+    test_flip_matrix_is_a_reflection_not_a_translation()
+    print("flip_matrix_reflection: passed")
+    test_affine_matrix_maps_the_image_centre_to_itself()
+    print("affine_matrix_geometry: passed")
+    test_affine_box_transform_clips_and_filters_degenerate_boxes()
+    print("affine_box_transform: passed")
+    test_affine_yolo_targets_stay_normalized_and_preserve_classes()
+    print("affine_yolo_targets: passed")
+    test_affine_warp_is_reproducible_and_stays_in_range()
+    print("affine_warp_contract: passed")
+    test_affine_datasets_keep_targets_aligned_and_are_reproducible()
+    print("affine_dataset_alignment: passed")
     test_photometric_policy_is_deterministic_and_preserves_tensor_contract()
     print("photometric_tensor_contract: passed")
     test_photometric_datasets_preserve_detection_targets()
