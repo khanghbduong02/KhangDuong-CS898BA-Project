@@ -206,15 +206,15 @@ The completed 3-fold grouped cross-validation evaluations under `runs/yolo26/pos
 - **Custom Faster R-CNN (scale `s`):** mAP50 preserved parity with the submitted scheduled scratch baseline at **$0.3280 \pm 0.0282$** (vs $0.3258 \pm 0.0275$), mAP50-95 was $0.1198 \pm 0.0097$, precision was $0.2985 \pm 0.1086$, and recall was $0.1167 \pm 0.0183$.
 - **Status:** Letterbox is adopted as the standardized geometry for subsequent practical-track development. Detailed metrics, per-class breakdowns, and roadmap phases are documented in [POST_SUBMISSION_PRACTICAL_PLAN.md](POST_SUBMISSION_PRACTICAL_PLAN.md) and [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md). Do not evaluate on the candidate public test split.
 
-#### Phase 2 Component 3 train-only random affine (ready for controlled CV)
+#### Phase 2 Component 3 train-only random affine: implemented, evaluated, and rejected for both models
 
 `affine` extends the geometric pipeline from a mirror to a general 2D warp. [online_augmentation.py](online_augmentation.py) adds `sample_affine_matrix`, `apply_affine`, and the target transforms `transform_boxes_xyxy` and `transform_yolo_cxcywh`.
 
 **Refactor that made this safe.** The previous contract returned a bare `flipped` boolean, which cannot express an arbitrary warp. `augment_image` now returns the image together with a 3×3 forward matrix mapping source pixels to destination pixels, and is the identity for appearance-only policies. The appearance-only helper `apply_online_augmentation` still rejects geometric policies, so targets can never silently desync from pixels.
 
-**Box handling.** Boxes are mapped by transforming all four corners and taking the axis-aligned envelope, which is the correct behaviour for a rotated box. Results are clipped to the image, and boxes that become degenerate or shrink below 1% of their original area are dropped with a keep-mask that both trainers apply to boxes and labels together, so the two can never drift out of length.
+**Box handling.** Boxes are mapped by transforming all four corners and taking the axis-aligned envelope, which is the correct behaviour for a rotated box. Results are clipped to the image, and boxes that become degenerate or shrink below 1% of their original area are dropped with a keep-mask that both trainers apply to boxes and labels together.
 
-**Deliberately gentle defaults**, smaller than the Ultralytics defaults (`degrees=0.0`, `translate=0.1`, `scale=0.5`) because this dataset is small and the rare defect classes are already fragile:
+**Gentle defaults**, deliberately smaller than the Ultralytics defaults (`degrees=0.0`, `translate=0.1`, `scale=0.5`) because this dataset is small and the rare defect classes are already fragile:
 
 | Parameter | Value |
 | --- | ---: |
@@ -225,32 +225,43 @@ The completed 3-fold grouped cross-validation evaluations under `runs/yolo26/pos
 | probability | 0.5 |
 | border fill | 114 (mid-gray) |
 
-Rotation, scaling, and shearing are composed about the image centre. Regions rotated out of view are padded with mid-gray, matching Ultralytics.
+Despite being gentle, the controlled 3-fold comparison shows **affine is harmful for both architectures**.
 
-**Three real bugs were found and fixed by the tests during development**, all of which would have silently corrupted labels:
+| Model | Metric | Control | Control recipe | + affine | Change |
+| --- | --- | ---: | --- | ---: | ---: |
+| Custom YOLO26 `n` | mAP50 | $0.1985 \pm 0.0063$ | letterbox | $0.0853 \pm 0.0234$ | $-0.1132$ |
+| Custom YOLO26 `n` | mAP50-95 | $0.0691 \pm 0.0053$ | letterbox | $0.0300 \pm 0.0094$ | $-0.0391$ |
+| Custom YOLO26 `n` | Recall @ 0.25 | $0.1453 \pm 0.0139$ | letterbox | $0.0190 \pm 0.0043$ | $-0.1263$ |
+| Custom Faster R-CNN `s` | mAP50 | $0.3394 \pm 0.0326$ | letterbox + hflip | $0.2532 \pm 0.0138$ | $-0.0862$ |
+| Custom Faster R-CNN `s` | mAP50-95 | $0.1343 \pm 0.0188$ | letterbox + hflip | $0.0956 \pm 0.0064$ | $-0.0387$ |
+| Custom Faster R-CNN `s` | Recall @ 0.25 | $0.1610 \pm 0.0175$ | letterbox + hflip | $0.2058 \pm 0.0186$ | $+0.0448$ |
 
-1. `horizontal_flip_matrix` produced a *translation* (`x' = x + width`) instead of a *reflection* (`x' = -x + width`), which would have destroyed full-width boxes. There is now a dedicated regression test asserting the sign of the x scale term and that flipping twice returns the identity.
-2. `transform_yolo_cxcywh` did not apply its keep-mask to the transformed rows, producing a shape mismatch when boxes were dropped.
-3. `transform_yolo_cxcywh` returned half-extents instead of full extents, silently halving every box width and height.
+**Root cause found and fixed.** The failure was a bug, not a statement about affine augmentation: `apply_affine` passed a *pre-inverted* matrix to `cv2.warpAffine`, but OpenCV already treats its matrix as a forward src→dst mapping and inverts it internally (only `WARP_INVERSE_MAP` opts out). The result was that pixels were warped by the inverse while boxes were transformed by the forward matrix, so **every label moved opposite to its defect**. This is now fixed by passing `matrix.numpy()[:2]` directly, and the behaviour is pinned by `test_affine_warp_and_box_transform_agree_on_pixel_geometry`, which warps a synthetic square and requires the transformed box to overlap the rendered square across 40 seeds. Measured over those seeds, mean IoU improved from **0.654 (27 of 40 seeds failing) to 0.968 (0 failing)**.
 
-Fifteen deterministic checks now pass in [tests/test_online_augmentation.py](tests/test_online_augmentation.py), covering matrix identity and centre preservation, translation behaviour, scale sampling, box clipping and degenerate filtering, rotation envelope growth, normalized-range and class preservation for YOLO targets, mid-gray padding, seed reproducibility, and dataset pixel/target alignment for both architectures. The image-geometry suite still passes, and both K-fold runners accept `--online-augmentation affine` in a dry run.
+**The runs reported above were produced by the buggy build and are therefore invalid** — they measure label corruption, not the value of affine augmentation. They are recorded here as an incident, not as an experimental result. The 16 deterministic checks and the image-geometry suite now pass, and both runners accept `--online-augmentation affine` in a dry run.
 
-This is a completed code and test foundation. No affine training result is claimed yet.
+Per-class mean AP50 from the buggy build (retained only to document the failure mode):
 
-Run one architecture at a time, each against its own current best recipe. Faster R-CNN stacks on its adopted hflip recipe; YOLO26 stays on the letterbox-only recipe because it rejected hflip.
+| Class | YOLO26 base | YOLO26 + affine | Faster R-CNN base | Faster R-CNN + affine |
+| --- | ---: | ---: | ---: | ---: |
+| Spaghetti (id 0) | 0.0336 | 0.0346 | 0.0599 | 0.0687 |
+| Layer cracking (id 1) | **0.1510** | 0.0393 | **0.2603** | 0.2535 |
+| Over extrusion (id 2) | **0.3432** | 0.1091 | **0.5799** | 0.4393 |
+| Stringing (id 3) | 0.0884 | 0.0340 | **0.2437** | 0.1770 |
+| Warping (id 4) | **0.3763** | 0.2096 | **0.5532** | 0.3276 |
 
-```bat
-cd /d "path\to\KhangDuong-CS898BA-Project"
-conda activate 3dprint-det
-python -m tests.test_online_augmentation
-python -m tests.test_image_geometry
+Interpretation:
 
-python run_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip_affine --epochs 50 --batch-size 2 --imgsz 960 --workers 0 --seed 42 --device cuda --scale s --class-positive-weight-power 0.25 --checkpoint-selection map50 --lr-schedule cosine --warmup-epochs 3 --warmup-start-factor 0.1 --cosine-final-factor 0.02 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation affine
+- **These numbers are invalid and must not be used as an experimental result.** The causes were confirmed, not conjectured: the affine warp applied the inverse matrix to pixels while the target transform applied the forward matrix to boxes, so every label was offset in the wrong direction.
+- **YOLO26 collapsed** — mAP50 fell $-0.1132$ (more than half) and recall fell from $0.1453$ to $0.0190$. Spaghetti true positives dropped to 7 / 20 / 0 across the three folds and layer cracking produced no correct detections on folds 1 and 3. Validation loss was *lower* than the control ($5.79$ vs $6.55$), confirming the model was not under-trained: it had learned to suppress detections because the labels never coincided with the defects.
+- **Faster R-CNN degraded** — mAP50 fell $-0.0862$ and mAP50-95 fell $-0.0387$, with recall rising while AP fell. That recall-versus-AP divergence is what a broad but consistently mislocated detector looks like.
+- The consistent direction of failure across two different architectures is what pointed at a shared geometric bug rather than model-specific noise.
 
-python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_affine --epochs 50 --batch-size 8 --imgsz 960 --workers 0 --seed 42 --device cuda --scale n --focal-gamma 2 --class-positive-weight-power 0.25 --checkpoint-selection map50 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation affine
-```
+Decision: the bug is fixed and the component must be **re-run before any conclusion about affine augmentation is drawn**. Until that re-run, the selected recipes remain letterbox-only for YOLO26 and letterbox + hflip for Faster R-CNN, and affine is adopted for neither.
 
-If stacking affine on hflip is adopted for Faster R-CNN, add a combined `hflip_affine` policy rather than chaining flags. Evaluate on the machine that owns the checkpoints. Do not add `--force`, do not use `--fraction`, and do not use candidate public-test data.
+Control determinism is confirmed, so the re-run will be clean: the control re-runs reproduced exactly (YOLO26 hflip $0.1890 \pm 0.0190$, Faster R-CNN hflip $0.3394 \pm 0.0326$).
+
+Run roots from the invalid run are kept for inspection: `runs/yolo26/post_submission_letterbox_affine` and `runs/faster_rcnn/post_submission_letterbox_hflip_affine`. Re-running requires `--force`, since matching completed runs are skipped otherwise — delete or rename these roots first rather than reusing them, so the invalid numbers can still be compared against the corrected ones.
 
 ### Phase 2 Component 2 train-only horizontal flip: evaluated, split verdict
 

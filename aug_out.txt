@@ -1,0 +1,16 @@
+flip_target_geometry: passed
+hflip_probability_and_seed: passed
+augment_image_identity_matrix: passed
+hflip_dataset_alignment: passed
+hflip_dataset_reproducibility: passed
+flip_matrix_reflection: passed
+affine_matrix_geometry: passed
+affine_box_transform: passed
+affine_yolo_targets: passed
+affine_warp_contract: passed
+affine_dataset_alignment: passed
+affine_pixel_geometry_agreement: passed
+photometric_tensor_contract: passed
+photometric_dataset_targets: passed
+hsv_tensor_contract: passed
+hsv_dataset_targets: passed

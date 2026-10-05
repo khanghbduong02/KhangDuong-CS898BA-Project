@@ -610,6 +610,57 @@ def test_flip_matrix_is_a_reflection_not_a_translation() -> None:
     assert torch.allclose(squared, identity_matrix(), atol=1e-6)
 
 
+def test_affine_warp_and_box_transform_agree_on_pixel_geometry() -> None:
+    """Regression: the image must move in the same direction as its boxes.
+
+    ``cv2.warpAffine`` treats its matrix as a forward src->dst mapping by default and
+    inverts it internally. Pre-inverting the matrix here would warp pixels opposite to
+    the boxes, leaving every label misaligned with its defect. This test renders a
+    synthetic square, warps it, transforms the square's box through the same matrix,
+    and requires the two to agree.
+    """
+    size = 64
+    box = torch.tensor([[16.0, 16.0, 48.0, 48.0]])
+    ious = []
+    for seed in range(40):
+        torch.manual_seed(seed)
+        image = torch.zeros(3, size, size)
+        image[:, 16:48, 16:48] = 1.0
+        warped, matrix = apply_affine(image, probability=1.0)
+        transformed, keep = transform_boxes_xyxy(box, matrix, size, size)
+        if not bool(keep[0]):
+            continue
+
+        rows, cols = torch.where(warped[0] > 0.5)
+        if rows.numel() == 0:
+            continue
+        ground_truth = torch.tensor(
+            [
+                float(cols.min()),
+                float(rows.min()),
+                float(cols.max()) + 1.0,
+                float(rows.max()) + 1.0,
+            ]
+        )
+        x1 = torch.maximum(transformed[0][0], ground_truth[0])
+        y1 = torch.maximum(transformed[0][1], ground_truth[1])
+        x2 = torch.minimum(transformed[0][2], ground_truth[2])
+        y2 = torch.minimum(transformed[0][3], ground_truth[3])
+        intersection = (x2 - x1).clamp(min=0.0) * (y2 - y1).clamp(min=0.0)
+        area_box = (transformed[0][2] - transformed[0][0]) * (
+            transformed[0][3] - transformed[0][1]
+        )
+        area_gt = (ground_truth[2] - ground_truth[0]) * (
+            ground_truth[3] - ground_truth[1]
+        )
+        ious.append(float(intersection / (area_box + area_gt - intersection)))
+
+    # Pre-inverting the matrix yielded a mean IoU of 0.654 with 27 of 40 seeds failing.
+    assert len(ious) >= 35
+    assert sum(1 for value in ious if value >= 0.7) == len(ious)
+    assert sum(ious) / len(ious) > 0.9
+
+
 def main() -> None:
     test_flip_targets_match_the_mirrored_image()
     print("flip_target_geometry: passed")
@@ -633,6 +684,8 @@ def main() -> None:
     print("affine_warp_contract: passed")
     test_affine_datasets_keep_targets_aligned_and_are_reproducible()
     print("affine_dataset_alignment: passed")
+    test_affine_warp_and_box_transform_agree_on_pixel_geometry()
+    print("affine_pixel_geometry_agreement: passed")
     test_photometric_policy_is_deterministic_and_preserves_tensor_contract()
     print("photometric_tensor_contract: passed")
     test_photometric_datasets_preserve_detection_targets()

@@ -1,0 +1,7 @@
+stretch_historical_compatibility: passed
+letterbox_label_round_trip: passed
+letterbox_detection_restoration: passed
+resize_mode_validation: passed
+checkpoint_resize_mode_resolution: passed
+yolo_dataset_resize_modes: passed
+faster_rcnn_dataset_resize_modes: passed

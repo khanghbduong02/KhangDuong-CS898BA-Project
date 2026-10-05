@@ -361,11 +361,13 @@ def apply_affine(
     source = image.detach().to(dtype=torch.float32).permute(1, 2, 0).numpy() * 255.0
     source = np.clip(source, 0, 255).astype(np.uint8)
 
-    # OpenCV maps destination to source coordinates, so invert the forward matrix.
-    inverse = np.linalg.inv(matrix.numpy())
+    # OpenCV's warpAffine takes a *forward* src->dst matrix by default and inverts it
+    # internally; only WARP_INVERSE_MAP opts out of that. Passing a pre-inverted matrix
+    # here would apply the inverse as the forward mapping, moving pixels opposite to
+    # the boxes. Pass the forward matrix directly.
     warped = cv2.warpAffine(
         source,
-        inverse[:2],
+        matrix.numpy()[:2],
         (width, height),
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
