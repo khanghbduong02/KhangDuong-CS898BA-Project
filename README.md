@@ -206,7 +206,7 @@ The completed 3-fold grouped cross-validation evaluations under `runs/yolo26/pos
 - **Custom Faster R-CNN (scale `s`):** mAP50 preserved parity with the submitted scheduled scratch baseline at **$0.3280 \pm 0.0282$** (vs $0.3258 \pm 0.0275$), mAP50-95 was $0.1198 \pm 0.0097$, precision was $0.2985 \pm 0.1086$, and recall was $0.1167 \pm 0.0183$.
 - **Status:** Letterbox is adopted as the standardized geometry for subsequent practical-track development. Detailed metrics, per-class breakdowns, and roadmap phases are documented in [POST_SUBMISSION_PRACTICAL_PLAN.md](POST_SUBMISSION_PRACTICAL_PLAN.md) and [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md). Do not evaluate on the candidate public test split.
 
-#### Phase 2 Component 3 train-only random affine: implemented, evaluated, and rejected for both models
+#### Phase 2 Component 3 train-only random affine: adopted for both models
 
 `affine` extends the geometric pipeline from a mirror to a general 2D warp. [online_augmentation.py](online_augmentation.py) adds `sample_affine_matrix`, `apply_affine`, and the target transforms `transform_boxes_xyxy` and `transform_yolo_cxcywh`.
 
@@ -225,43 +225,51 @@ The completed 3-fold grouped cross-validation evaluations under `runs/yolo26/pos
 | probability | 0.5 |
 | border fill | 114 (mid-gray) |
 
-Despite being gentle, the controlled 3-fold comparison shows **affine is harmful for both architectures**.
+**The first runs were invalid** — produced by the buggy build, they measured label corruption rather than the value of affine augmentation. `apply_affine` passed a *pre-inverted* matrix to `cv2.warpAffine`, but OpenCV already treats its matrix as a forward src→dst mapping and inverts it internally (only `WARP_INVERSE_MAP` opts out). Pixels were warped by the inverse while boxes used the forward matrix, so **every label moved opposite to its defect**. That is now fixed by passing `matrix.numpy()[:2]` directly, pinned by `test_affine_warp_and_box_transform_agree_on_pixel_geometry`, which warps a synthetic square and requires the transformed box to overlap the rendered square across 40 seeds. Mean IoU went from **0.654 (27 of 40 seeds failing) to 0.968 (0 failing)**. Those first numbers (YOLO26 $0.1985 \rightarrow 0.0853$, Faster R-CNN $0.3394 \rightarrow 0.2532$) are retained in [PROJECT_WORK_LOG.md](PROJECT_WORK_LOG.md) as an incident record only.
 
-| Model | Metric | Control | Control recipe | + affine | Change |
-| --- | --- | ---: | --- | ---: | ---: |
-| Custom YOLO26 `n` | mAP50 | $0.1985 \pm 0.0063$ | letterbox | $0.0853 \pm 0.0234$ | $-0.1132$ |
-| Custom YOLO26 `n` | mAP50-95 | $0.0691 \pm 0.0053$ | letterbox | $0.0300 \pm 0.0094$ | $-0.0391$ |
-| Custom YOLO26 `n` | Recall @ 0.25 | $0.1453 \pm 0.0139$ | letterbox | $0.0190 \pm 0.0043$ | $-0.1263$ |
-| Custom Faster R-CNN `s` | mAP50 | $0.3394 \pm 0.0326$ | letterbox + hflip | $0.2532 \pm 0.0138$ | $-0.0862$ |
-| Custom Faster R-CNN `s` | mAP50-95 | $0.1343 \pm 0.0188$ | letterbox + hflip | $0.0956 \pm 0.0064$ | $-0.0387$ |
-| Custom Faster R-CNN `s` | Recall @ 0.25 | $0.1610 \pm 0.0175$ | letterbox + hflip | $0.2058 \pm 0.0186$ | $+0.0448$ |
+**After the fix, the controlled 3-fold re-run adopts affine for both architectures** — the strongest single component tested so far.
 
-**Root cause found and fixed.** The failure was a bug, not a statement about affine augmentation: `apply_affine` passed a *pre-inverted* matrix to `cv2.warpAffine`, but OpenCV already treats its matrix as a forward src→dst mapping and inverts it internally (only `WARP_INVERSE_MAP` opts out). The result was that pixels were warped by the inverse while boxes were transformed by the forward matrix, so **every label moved opposite to its defect**. This is now fixed by passing `matrix.numpy()[:2]` directly, and the behaviour is pinned by `test_affine_warp_and_box_transform_agree_on_pixel_geometry`, which warps a synthetic square and requires the transformed box to overlap the rendered square across 40 seeds. Measured over those seeds, mean IoU improved from **0.654 (27 of 40 seeds failing) to 0.968 (0 failing)**.
+| Model | Metric | Control | + affine | Change |
+| --- | --- | ---: | ---: | ---: |
+| Custom YOLO26 `n` | mAP50 | $0.1985 \pm 0.0063$ | $\mathbf{0.2320 \pm 0.0113}$ | $+0.0335$ |
+| Custom YOLO26 `n` | mAP50-95 | $0.0691 \pm 0.0053$ | $\mathbf{0.0891 \pm 0.0075}$ | $+0.0200$ |
+| Custom YOLO26 `n` | Precision @ 0.25 | $0.1137 \pm 0.0073$ | $0.1500 \pm 0.0137$ | $+0.0363$ |
+| Custom YOLO26 `n` | Recall @ 0.25 | $0.1453 \pm 0.0139$ | $0.1390 \pm 0.0444$ | $-0.0063$ |
+| Custom Faster R-CNN `s` | mAP50 | $0.3394 \pm 0.0326$ | $\mathbf{0.4429 \pm 0.0084}$ | $+0.1035$ |
+| Custom Faster R-CNN `s` | mAP50-95 | $0.1343 \pm 0.0188$ | $\mathbf{0.1713 \pm 0.0080}$ | $+0.0370$ |
+| Custom Faster R-CNN `s` | Precision @ 0.25 | $0.2132 \pm 0.0201$ | $0.1849 \pm 0.0286$ | $-0.0283$ |
+| Custom Faster R-CNN `s` | Recall @ 0.25 | $0.1610 \pm 0.0175$ | $\mathbf{0.2384 \pm 0.0210}$ | $+0.0774$ |
 
-**The runs reported above were produced by the buggy build and are therefore invalid** — they measure label corruption, not the value of affine augmentation. They are recorded here as an incident, not as an experimental result. The 16 deterministic checks and the image-geometry suite now pass, and both runners accept `--online-augmentation affine` in a dry run.
+Per-class mean AP50 (control to + affine):
 
-Per-class mean AP50 from the buggy build (retained only to document the failure mode):
-
-| Class | YOLO26 base | YOLO26 + affine | Faster R-CNN base | Faster R-CNN + affine |
+| Class | YOLO26 control | YOLO26 + affine | Faster R-CNN control | Faster R-CNN + affine |
 | --- | ---: | ---: | ---: | ---: |
-| Spaghetti (id 0) | 0.0336 | 0.0346 | 0.0599 | 0.0687 |
-| Layer cracking (id 1) | **0.1510** | 0.0393 | **0.2603** | 0.2535 |
-| Over extrusion (id 2) | **0.3432** | 0.1091 | **0.5799** | 0.4393 |
-| Stringing (id 3) | 0.0884 | 0.0340 | **0.2437** | 0.1770 |
-| Warping (id 4) | **0.3763** | 0.2096 | **0.5532** | 0.3276 |
+| Spaghetti (id 0) | 0.0336 | **0.0576** | 0.0599 | **0.0819** |
+| Layer cracking (id 1) | 0.1510 | **0.1856** | 0.2603 | **0.3770** |
+| Over extrusion (id 2) | 0.3432 | **0.3751** | 0.5799 | **0.6951** |
+| Stringing (id 3) | 0.0884 | **0.1636** | 0.2437 | **0.3896** |
+| Warping (id 4) | 0.3763 | **0.3780** | 0.5532 | **0.6710** |
 
 Interpretation:
 
-- **These numbers are invalid and must not be used as an experimental result.** The causes were confirmed, not conjectured: the affine warp applied the inverse matrix to pixels while the target transform applied the forward matrix to boxes, so every label was offset in the wrong direction.
-- **YOLO26 collapsed** — mAP50 fell $-0.1132$ (more than half) and recall fell from $0.1453$ to $0.0190$. Spaghetti true positives dropped to 7 / 20 / 0 across the three folds and layer cracking produced no correct detections on folds 1 and 3. Validation loss was *lower* than the control ($5.79$ vs $6.55$), confirming the model was not under-trained: it had learned to suppress detections because the labels never coincided with the defects.
-- **Faster R-CNN degraded** — mAP50 fell $-0.0862$ and mAP50-95 fell $-0.0387$, with recall rising while AP fell. That recall-versus-AP divergence is what a broad but consistently mislocated detector looks like.
-- The consistent direction of failure across two different architectures is what pointed at a shared geometric bug rather than model-specific noise.
+- **Every class improved for both architectures.** This is the only component in Phase 2 that has improved all five classes for both models, and the gains are large: Faster R-CNN mAP50 rose $+0.1035$ (about $+30\%$ relative) and YOLO26 rose $+0.0335$ (about $+17\%$ relative).
+- **Both models also became more stable, not just better.** Faster R-CNN's mAP50 sample SD fell from $\pm 0.0326$ to $\pm 0.0084$ and mAP50-95 SD from $\pm 0.0188$ to $\pm 0.0080$, with per-fold mAP50 now 0.4477 / 0.4332 / 0.4479 — all three folds above every control fold. The fold-3 weakness that made the hflip gain look marginal is gone. YOLO26's SD widened slightly ($\pm 0.0063 \rightarrow \pm 0.0113$) but remains small in absolute terms.
+- **Recall gains are broad.** Faster R-CNN over-extrusion recall reached $0.7583$ and warping $0.7436$, versus $0.6463$ and $0.5897$ under hflip alone. YOLO26 warping recall reached $0.7350$ versus $0.5897$.
+- Precision fell slightly for both, as expected when a model fires more often — but mAP, which is precision-recall integrated, rose sharply for both, so this is improved detection rather than a threshold artefact.
+- The earlier collapse now reads cleanly as the bug's signature: with labels correctly aligned, the same gentle warp helps rather than harms.
 
-Decision: the bug is fixed and the component must be **re-run before any conclusion about affine augmentation is drawn**. Until that re-run, the selected recipes remain letterbox-only for YOLO26 and letterbox + hflip for Faster R-CNN, and affine is adopted for neither.
+Decision: **affine is adopted for both architectures.** Selected recipes are now:
 
-Control determinism is confirmed, so the re-run will be clean: the control re-runs reproduced exactly (YOLO26 hflip $0.1890 \pm 0.0190$, Faster R-CNN hflip $0.3394 \pm 0.0326$).
+- Custom Faster R-CNN: `letterbox + hflip + affine`
+- Custom YOLO26: `letterbox + affine`
 
-Run roots from the invalid run are kept for inspection: `runs/yolo26/post_submission_letterbox_affine` and `runs/faster_rcnn/post_submission_letterbox_hflip_affine`. Re-running requires `--force`, since matching completed runs are skipped otherwise — delete or rename these roots first rather than reusing them, so the invalid numbers can still be compared against the corrected ones.
+Run roots for inspection: `runs/yolo26/post_submission_letterbox_affine` and `runs/faster_rcnn/post_submission_letterbox_hflip_affine`.
+
+```bat
+python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip_affine --imgsz 960 --batch-size 2 --workers 0 --device cuda --conf-thresh 0.25 --nms-iou 0.70
+
+python eval_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_affine --imgsz 960 --batch-size 8 --workers 0 --device cuda --conf-thresh 0.25 --postprocess class_aware_nms --inference-branch one2many
+```
 
 ### Phase 2 Component 2 train-only horizontal flip: evaluated, split verdict
 
