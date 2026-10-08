@@ -9,7 +9,11 @@ import torch
 
 from online_augmentation import (
     AFFINE_BORDER_VALUE,
+    AFFINE_PRESETS,
     DEFAULT_AFFINE_DEGREES,
+    DEFAULT_AFFINE_SCALE,
+    DEFAULT_AFFINE_SHEAR,
+    DEFAULT_AFFINE_TRANSLATE,
     DEFAULT_HFLIP_PROB,
     DEFAULT_ONLINE_AUGMENTATION,
     apply_affine,
@@ -661,6 +665,152 @@ def test_affine_warp_and_box_transform_agree_on_pixel_geometry() -> None:
     assert sum(ious) / len(ious) > 0.9
 
 
+def test_affine_strength_presets_are_valid_and_ordered() -> None:
+    """Each preset must validate, be geometric, and be strictly gentler than the next."""
+    expected = ["affine", "affine_medium", "affine_strong"]
+    assert [name for name in AFFINE_PRESETS] == expected
+
+    previous = None
+    for name in expected:
+        assert validate_online_augmentation(name) == name
+        # Geometric policies must be rejected by the appearance-only helper.
+        try:
+            apply_online_augmentation(torch.rand(3, 8, 8), name)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected the appearance-only helper to reject {name}")
+
+        degrees, translate, scale, shear = AFFINE_PRESETS[name]
+        # Parameters must satisfy sample_affine_matrix's contract.
+        assert degrees >= 0.0
+        assert 0.0 <= translate < 1.0
+        assert 0.0 <= scale <= 1.0
+        assert shear >= 0.0
+
+        # Every preset must be at least as strong as the one before it.
+        if previous is not None:
+            prev_degrees, prev_translate, prev_scale, _ = previous
+            assert (degrees, translate, scale) > (prev_degrees, prev_translate, prev_scale)
+        previous = (degrees, translate, scale, shear)
+
+    # The gentle preset is the adopted one and must match the historical defaults.
+    assert AFFINE_PRESETS["affine"] == (
+        DEFAULT_AFFINE_DEGREES,
+        DEFAULT_AFFINE_TRANSLATE,
+        DEFAULT_AFFINE_SCALE,
+        DEFAULT_AFFINE_SHEAR,
+    )
+    # The strong preset reaches the official Ultralytics translate/scale territory.
+    assert AFFINE_PRESETS["affine_strong"][2] == 0.50
+
+    # Unknown names are still rejected.
+    try:
+        validate_online_augmentation("affine_extreme")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Expected ValueError for an unknown affine preset")
+
+
+def test_affine_strength_presets_scale_the_warp_magnitude() -> None:
+    """A stronger preset must move content further, not merely differ randomly."""
+    image = torch.zeros(3, 64, 64)
+    image[:, 16:48, 16:48] = 1.0
+    box = torch.tensor([[16.0, 16.0, 48.0, 48.0]])
+
+    displacement = {}
+    for name in AFFINE_PRESETS:
+        # Seed 3 fires the probability draw; other seeds can skip the warp entirely,
+        # which would silently pass a vacuous assertion.
+        torch.manual_seed(3)
+        warped, matrix = augment_image(image, name)
+        transformed, keep = transform_boxes_xyxy(box, matrix, 64, 64)
+        assert bool(keep[0]), f"{name} dropped a fully interior box"
+
+        rows, cols = torch.where(warped[0] > 0.5)
+        assert rows.numel() > 0, f"{name} produced an empty warp"
+        ground_truth = torch.tensor(
+            [
+                float(cols.min()),
+                float(rows.min()),
+                float(cols.max()) + 1.0,
+                float(rows.max()) + 1.0,
+            ]
+        )
+        # The box and the rendered pixels must agree for every preset strength.
+        assert torch.abs(transformed[0] - ground_truth).max() < 8.0, (
+            f"{name}: box {transformed[0].tolist()} does not match pixels "
+            f"{ground_truth.tolist()}"
+        )
+        # Warp magnitude is how far the box moved from its original position.
+        displacement[name] = float(torch.abs(transformed[0] - box[0]).max())
+        assert warped.shape == image.shape
+        assert float(warped.min()) >= 0.0 and float(warped.max()) <= 1.0
+
+    # The same seed produces the same underlying random draws, so a stronger preset
+    # must move content at least as far as a gentler one, and strictly further overall.
+    assert displacement["affine"] > 0.0, "the warp did not fire, so nothing was measured"
+    assert (
+        displacement["affine"]
+        <= displacement["affine_medium"] <= displacement["affine_strong"]
+    )
+    assert displacement["affine_strong"] > displacement["affine"]
+
+
+def test_affine_strength_presets_keep_targets_valid_and_reproducible() -> None:
+    """Every preset must keep targets in frame, non-degenerate, and seed-reproducible."""
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        split_root = Path(temporary_directory) / "train"
+        _write_detection_split(split_root)
+
+        plain_yolo = YoloDetectionDataset(split_root, imgsz=32)
+        _, plain_labels = plain_yolo[0]
+        plain_classes = set(plain_labels[:, 0].tolist())
+        plain_faster = FasterRCNNDataset(split_root, imgsz=32, num_classes=2)
+        _, plain_target = plain_faster[0]
+
+        for name in AFFINE_PRESETS:
+            yolo = YoloDetectionDataset(split_root, imgsz=32, online_augmentation=name)
+            faster = FasterRCNNDataset(
+                split_root, imgsz=32, num_classes=2, online_augmentation=name
+            )
+
+            for seed in range(6):
+                torch.manual_seed(seed)
+                image, labels = yolo[0]
+                assert torch.isfinite(image).all()
+                assert float(image.min()) >= 0.0 and float(image.max()) <= 1.0
+                if labels.numel():
+                    assert (labels[:, 1] >= 0.0).all() and (labels[:, 1] <= 1.0).all()
+                    assert (labels[:, 2] >= 0.0).all() and (labels[:, 2] <= 1.0).all()
+                    assert (labels[:, 3] > 0.0).all() and (labels[:, 4] > 0.0).all()
+                    assert set(labels[:, 0].tolist()).issubset(plain_classes)
+
+                torch.manual_seed(seed)
+                faster_image, target = faster[0]
+                boxes = target["boxes"]
+                if boxes.numel():
+                    assert float(boxes[:, 0].min()) >= 0.0
+                    assert float(boxes[:, 1].min()) >= 0.0
+                    assert float(boxes[:, 2].max()) <= 32
+                    assert float(boxes[:, 3].max()) <= 32
+                    assert (boxes[:, 2] > boxes[:, 0]).all()
+                    assert (boxes[:, 3] > boxes[:, 1]).all()
+                assert boxes.shape[0] == target["labels"].shape[0]
+                assert set(target["labels"].tolist()).issubset(
+                    set(plain_target["labels"].tolist())
+                )
+
+            # Identical seeds reproduce identical samples for every preset.
+            torch.manual_seed(41)
+            first_image, first_labels = yolo[0]
+            torch.manual_seed(41)
+            second_image, second_labels = yolo[0]
+            assert torch.equal(first_image, second_image)
+            assert torch.equal(first_labels, second_labels)
+
+
 def main() -> None:
     test_flip_targets_match_the_mirrored_image()
     print("flip_target_geometry: passed")
@@ -686,6 +836,12 @@ def main() -> None:
     print("affine_dataset_alignment: passed")
     test_affine_warp_and_box_transform_agree_on_pixel_geometry()
     print("affine_pixel_geometry_agreement: passed")
+    test_affine_strength_presets_are_valid_and_ordered()
+    print("affine_preset_contract: passed")
+    test_affine_strength_presets_scale_the_warp_magnitude()
+    print("affine_preset_magnitude: passed")
+    test_affine_strength_presets_keep_targets_valid_and_reproducible()
+    print("affine_preset_targets: passed")
     test_photometric_policy_is_deterministic_and_preserves_tensor_contract()
     print("photometric_tensor_contract: passed")
     test_photometric_datasets_preserve_detection_targets()

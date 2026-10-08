@@ -269,6 +269,62 @@ Run roots for inspection: `runs/yolo26/post_submission_letterbox_affine` and `ru
 python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip_affine --imgsz 960 --batch-size 2 --workers 0 --device cuda --conf-thresh 0.25 --nms-iou 0.70
 
 python eval_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_affine --imgsz 960 --batch-size 8 --workers 0 --device cuda --conf-thresh 0.25 --postprocess class_aware_nms --inference-branch one2many
+
+### Phase 2 Component 4 affine-strength presets: implemented and tested
+
+`affine_medium` and `affine_strong` extend the adopted `affine` preset so the single affine variable is a controlled strength sweep. [online_augmentation.py](online_augmentation.py) defines `AFFINE_PRESETS`, each a (degrees, translate, scale, shear) tuple, and `augment_image` routes any mode in AFFINE_PRESETS through the strength parameters; all three presets share probability 0.5, so only magnitude changes between presets.
+
+| Preset | `degrees` | `translate` | `scale` | `shear` |
+| --- | ---: | ---: | ---: | ---: |
+| `affine` | +/-5.0 | +/-0.05 | +/-0.10 | 0.0 |
+| `affine_medium` | +/-10.0 | +/-0.10 | +/-0.25 | 0.0 |
+| `affine_strong` | +/-15.0 | +/-0.15 | +/-0.50 | 0.0 |
+
+`affine` is the adopted gentle setting. `affine_medium` sits at the official Ultralytics translate=0.1 and `affine_strong` at its scale=0.5, with an added rotation, so each step from one preset to the next is one variable at a time.
+
+**Test status (19-check augmentation suite plus 7-check image-geometry suite: all green).** A contract test asserts that each preset has valid parameters, that the presets are ordered affine <= affine_medium <= affine_strong, that the appearance-only helper apply_online_augmentation rejects all three geometric presets while still rejecting unknown names, and that the two runners accept all three names. A magnitude test asserts box/pixel agreement at every strength and that a shared seed moves content strictly further into the image as the preset strengthens: measured pixel displacement is affine 3.37 to affine_medium 7.85 to affine_strong 14.46, and monotonicity holds across every seed probed. A targets test asserts every preset keeps boxes in frame, non-degenerate, class-preserving, and seed-reproducible for both trainers. The warp fires probabilistically, so many seeds skip it entirely; the magnitude test pins a firing seed and asserts displacement is non-zero, otherwise the ordering assertion would pass vacuously.
+
+No evaluation against each architecture current best recipe has been run yet, so Component 4 reports no result. Run one preset at a time, evaluating a completed fold set with the same selected epochs, checkpoint selection, and postprocessing used above.
+
+```bat
+:: Train YOLO26, fold 1-3 (all folds discovered automatically when --folds is omitted)
+python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_affine --epochs 50 --batch-size 8 --imgsz 960 --workers 0 --seed 42 --device cuda --scale n --focal-gamma 2 --class-positive-weight-power 0.25 --checkpoint-selection map50 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation affine
+
+:: Train YOLO26, fold 1-3
+python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_affine_medium --epochs 50 --batch-size 8 --imgsz 960 --workers 0 --seed 42 --device cuda --scale n --focal-gamma 2 --class-positive-weight-power 0.25 --checkpoint-selection map50 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation affine_medium
+
+:: Train YOLO26, fold 1-3
+python run_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_affine_strong --epochs 50 --batch-size 8 --imgsz 960 --workers 0 --seed 42 --device cuda --scale n --focal-gamma 2 --class-positive-weight-power 0.25 --checkpoint-selection map50 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation affine_strong
+
+:: Evaluate each trained fold set
+python eval_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_affine --imgsz 960 --batch-size 8 --workers 0 --device cuda --conf-thresh 0.25
+python eval_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_affine_medium --imgsz 960 --batch-size 8 --workers 0 --device cuda --conf-thresh 0.25
+python eval_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/yolo26/post_submission_letterbox_affine_strong --imgsz 960 --batch-size 8 --workers 0 --device cuda --conf-thresh 0.25
+```
+
+```bat
+:: Train Faster R-CNN, fold 1-3
+python run_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip_affine --epochs 50 --batch-size 2 --imgsz 960 --workers 0 --seed 42 --device cuda --scale s --class-positive-weight-power 0.25 --checkpoint-selection map50 --lr-schedule cosine --warmup-epochs 3 --warmup-start-factor 0.1 --cosine-final-factor 0.02 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation affine
+
+:: Train Faster R-CNN, fold 1-3
+python run_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip_affine_medium --epochs 50 --batch-size 2 --imgsz 960 --workers 0 --seed 42 --device cuda --scale s --class-positive-weight-power 0.25 --checkpoint-selection map50 --lr-schedule cosine --warmup-epochs 3 --warmup-start-factor 0.1 --cosine-final-factor 0.02 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation affine_medium
+
+:: Train Faster R-CNN, fold 1-3
+python run_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip_affine_strong --epochs 50 --batch-size 2 --imgsz 960 --workers 0 --seed 42 --device cuda --scale s --class-positive-weight-power 0.25 --checkpoint-selection map50 --lr-schedule cosine --warmup-epochs 3 --warmup-start-factor 0.1 --cosine-final-factor 0.02 --reduce-lr-patience 0 --reduce-lr-cooldown 0 --early-stopping-patience 0 --ema-decay 0 --resize-mode letterbox --online-augmentation affine_strong
+
+:: Evaluate each trained fold set
+python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip_affine --imgsz 960 --batch-size 2 --workers 0 --device cuda --conf-thresh 0.25
+python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip_affine_medium --imgsz 960 --batch-size 2 --workers 0 --device cuda --conf-thresh 0.25
+python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip_affine_strong --imgsz 960 --batch-size 2 --workers 0 --device cuda --conf-thresh 0.25
+```
+
+**Final recipe stack (Component 3 adopted for both models):**
+
+- Custom Faster R-CNN: letterbox + hflip + `affine`  (affine_medium / affine_strong pending)
+- Custom YOLO26: letterbox + `affine`  (affine_medium / affine_strong pending)
+
+**Deferrals:** perspective, mosaic, and mix-up are deferred until Component 4 is recorded.
+
 ```
 
 ### Phase 2 Component 2 train-only horizontal flip: evaluated, split verdict

@@ -20,12 +20,6 @@ import torch
 
 
 DEFAULT_ONLINE_AUGMENTATION = "none"
-ONLINE_AUGMENTATION_CHOICES = ("none", "photometric", "hsv", "hflip", "affine")
-
-# Official Ultralytics horizontal flip probability (fliplr in the default dataset config)
-DEFAULT_HFLIP_PROB = 0.5
-
-GEOMETRIC_ONLINE_AUGMENTATIONS = ("hflip", "affine")
 
 # Deliberately gentler than the Ultralytics defaults (degrees=0.0, translate=0.1,
 # scale=0.5). This dataset is small and the rare defect classes are already fragile,
@@ -35,6 +29,29 @@ DEFAULT_AFFINE_TRANSLATE = 0.05
 DEFAULT_AFFINE_SCALE = 0.10
 DEFAULT_AFFINE_SHEAR = 0.0
 DEFAULT_AFFINE_PROB = 0.5
+
+# Affine strength presets: name -> (degrees, translate, scale, shear).
+# `affine` is the gentle setting that is already adopted. The stronger presets step
+# toward the official Ultralytics defaults (translate=0.1, scale=0.5) so the effect of
+# augmentation magnitude can be tested one variable at a time.
+AFFINE_PRESETS: dict = {
+    "affine": (DEFAULT_AFFINE_DEGREES, DEFAULT_AFFINE_TRANSLATE, DEFAULT_AFFINE_SCALE, DEFAULT_AFFINE_SHEAR),
+    "affine_medium": (10.0, 0.10, 0.25, 0.0),
+    "affine_strong": (15.0, 0.15, 0.50, 0.0),
+}
+
+ONLINE_AUGMENTATION_CHOICES = (
+    "none",
+    "photometric",
+    "hsv",
+    "hflip",
+    *AFFINE_PRESETS,
+)
+
+# Official Ultralytics horizontal flip probability (fliplr in the default dataset config)
+DEFAULT_HFLIP_PROB = 0.5
+
+GEOMETRIC_ONLINE_AUGMENTATIONS = ("hflip", *AFFINE_PRESETS)
 
 # Ultralytics pads warped regions with mid-gray.
 AFFINE_BORDER_VALUE = 114
@@ -400,8 +417,15 @@ def augment_image(image: torch.Tensor, mode: str) -> Tuple[torch.Tensor, torch.T
     if mode == "hflip":
         flipped, applied = apply_horizontal_flip(image)
         return flipped, horizontal_flip_matrix(width) if applied else identity_matrix()
-    if mode == "affine":
-        return apply_affine(image)
+    if mode in AFFINE_PRESETS:
+        degrees, translate, scale, shear = AFFINE_PRESETS[mode]
+        return apply_affine(
+            image,
+            degrees=degrees,
+            translate=translate,
+            scale=scale,
+            shear=shear,
+        )
 
     return apply_online_augmentation(image, mode), identity_matrix()
 
