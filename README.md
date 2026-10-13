@@ -284,7 +284,7 @@ python eval_yolo26_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --r
 
 **Test status (19-check augmentation suite plus 7-check image-geometry suite: all green).** A contract test asserts that each preset has valid parameters, that the presets are ordered affine <= affine_medium <= affine_strong, that the appearance-only helper apply_online_augmentation rejects all three geometric presets while still rejecting unknown names, and that the two runners accept all three names. A magnitude test asserts box/pixel agreement at every strength and that a shared seed moves content strictly further into the image as the preset strengthens: measured pixel displacement is affine 3.37 to affine_medium 7.85 to affine_strong 14.46, and monotonicity holds across every seed probed. A targets test asserts every preset keeps boxes in frame, non-degenerate, class-preserving, and seed-reproducible for both trainers. The warp fires probabilistically, so many seeds skip it entirely; the magnitude test pins a firing seed and asserts displacement is non-zero, otherwise the ordering assertion would pass vacuously.
 
-No evaluation against each architecture current best recipe has been run yet, so Component 4 reports no result. Run one preset at a time, evaluating a completed fold set with the same selected epochs, checkpoint selection, and postprocessing used above.
+No evaluation against each architecture current best recipe has now been run for all three presets, so Component 4 reports a result and a selected recipe (see table below). The controlled three-preset sweep on the frozen 3-fold grouped CV at 960 px confirms `affine` as the selected recipe for both models; each step up in strength (`affine_medium` then `affine_strong`) monotonically degraded mAP50 and widened fold spread.
 
 ```bat
 :: Train YOLO26, fold 1-3 (all folds discovered automatically when --folds is omitted)
@@ -318,12 +318,16 @@ python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v
 python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v1 --run-root runs/faster_rcnn/post_submission_letterbox_hflip_affine_strong --imgsz 960 --batch-size 2 --workers 0 --device cuda --conf-thresh 0.25
 ```
 
-**Final recipe stack (Component 3 adopted for both models):**
+**Final recipe stack (Component 4 confirmed, both models):**
 
-- Custom Faster R-CNN: letterbox + hflip + `affine`  (affine_medium / affine_strong pending)
-- Custom YOLO26: letterbox + `affine`  (affine_medium / affine_strong pending)
+| Model | Recipe | mAP50 mean ± SD |
+| --- | --- | ---: |
+| Custom YOLO26 | letterbox + `affine` | 0.2320 ± 0.0113 |
+| Custom Faster R-CNN | letterbox + hflip + `affine` | 0.4429 ± 0.0084 |
 
-**Deferrals:** perspective, mosaic, and mix-up are deferred until Component 4 is recorded.
+Stepwise check (mean mAP50): `affine` > `affine_medium` > `affine_strong` for both models, so the simplest strength is the selected one.
+
+**Deferrals:** perspective, mosaic, and mix-up remain deferred until their own components are scored.
 
 ```
 
