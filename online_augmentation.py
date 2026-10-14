@@ -40,18 +40,25 @@ AFFINE_PRESETS: dict = {
     "affine_strong": (15.0, 0.15, 0.50, 0.0),
 }
 
+MOSAIC_PRESETS: dict = {
+    "mosaic": (0.0, 0.0, 0.0, 0.0),
+    "mosaic_medium": (2.0, 0.025, 0.15, 0.0),
+    "mosaic_strong": (4.0, 0.05, 0.30, 0.0),
+}
+
+# Official Ultralytics horizontal flip probability (fliplr in the default dataset config)
+DEFAULT_HFLIP_PROB = 0.5
+
+GEOMETRIC_ONLINE_AUGMENTATIONS = ("hflip", *AFFINE_PRESETS, *MOSAIC_PRESETS)
+
 ONLINE_AUGMENTATION_CHOICES = (
     "none",
     "photometric",
     "hsv",
     "hflip",
     *AFFINE_PRESETS,
+    *MOSAIC_PRESETS,
 )
-
-# Official Ultralytics horizontal flip probability (fliplr in the default dataset config)
-DEFAULT_HFLIP_PROB = 0.5
-
-GEOMETRIC_ONLINE_AUGMENTATIONS = ("hflip", *AFFINE_PRESETS)
 
 # Ultralytics pads warped regions with mid-gray.
 AFFINE_BORDER_VALUE = 114
@@ -392,6 +399,120 @@ def apply_affine(
     )
     result = torch.from_numpy(warped).permute(2, 0, 1).to(dtype=image.dtype) / 255.0
     return result, matrix
+
+
+def apply_mosaic(
+    images: list,
+    labels_list: list,
+    height: int,
+    width: int,
+    probability: float = 0.5,
+    degrees: float = 0.0,
+    translate: float = 0.1,
+    scale: float = 0.5,
+    shear: float = 0.0,
+):
+    """Composite multiple images into a 2x2 mosaic and return the mosaic plus combined labels.
+
+    Each image is scaled by a random factor, then placed into one quadrant of the
+    mosaic canvas (same ``(height, width)`` as the inputs).  Boxes are transformed
+    into mosaic-pixel coordinates, clipped to the canvas, and filtered when the
+    clipped area drops below ``MIN_AFFINE_BOX_AREA_FRACTION`` of the original.
+
+    Returns ``(mosaic, combined_labels)`` where ``combined_labels`` has the same
+    column layout as the inputs (either ``(N, 5)`` YOLO cxcywh or ``(N, 4)``
+    absolute XYXY).  ``classes_list`` / ``class_ids_list`` are kept in the same
+    order as the kept boxes.
+    """
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("mosaic probability must be in [0, 1]")
+    if len(images) != len(labels_list):
+        raise ValueError("images and labels_list must have the same length")
+    if not images:
+        raise ValueError("mosaic requires at least one image")
+
+    # Decide whether to fire this draw.
+    if float(torch.rand(())) >= probability:
+        return images[0], labels_list[0]
+
+    canvas = torch.zeros((3, height, width), dtype=images[0].dtype)
+    half_h = height // 2
+    half_w = width // 2
+
+    all_boxes_xyxy: list = []
+    all_labels: list = []
+
+    for idx, (img, labels) in enumerate(zip(images, labels_list)):
+        # Quadrant top-left corner in mosaic coordinates.
+        qx = (idx % 2) * half_w
+        qy = (idx // 2) * half_h
+
+        # Per-quadrant affine (shared matrix for pixel + box).
+        matrix = sample_affine_matrix(half_h, half_w, degrees, translate, scale, shear)
+
+        # Warp the image to the quadrant size.
+        source = img.detach().to(dtype=torch.float32).permute(1, 2, 0).numpy() * 255.0
+        source = np.clip(source, 0, 255).astype(np.uint8)
+        warped = cv2.warpAffine(
+            source,
+            matrix.numpy()[:2],
+            (half_w, half_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(AFFINE_BORDER_VALUE,) * 3,
+        )
+
+        # Place the warped quadrant into the canvas.
+        canvas[:, qy:qy + half_h, qx:qx + half_w] = (
+            torch.from_numpy(warped).permute(2, 0, 1).to(canvas.dtype) / 255.0
+        )
+
+        # Transform labels through the same matrix and shift into mosaic coords.
+        if labels.numel() == 0:
+            continue
+
+        # Interpret labels: (N, 5) = YOLO (class, cx, cy, w, h); (N, 4) = XYXY.
+        is_yolo = labels.shape[-1] == 5
+        if is_yolo:
+            extent = torch.tensor([float(half_w), float(half_h)], dtype=torch.float32)
+            centres = labels[:, 1:3] * extent
+            half = labels[:, 3:5] * extent / 2.0
+            boxes_xyxy = torch.cat([centres - half, centres + half], dim=1)
+        else:
+            boxes_xyxy = labels.to(torch.float32)
+
+        transformed, keep = transform_boxes_xyxy(
+            boxes_xyxy, matrix, half_h, half_w, MIN_AFFINE_BOX_AREA_FRACTION
+        )
+
+        # Shift into mosaic coordinates.
+        shifted = transformed.clone()
+        shifted[:, 0] += qx
+        shifted[:, 2] += qx
+        shifted[:, 1] += qy
+        shifted[:, 3] += qy
+
+        if is_yolo:
+            kept_labels = labels[keep]
+            extent_mosaic = torch.tensor(
+                [float(width), float(height)], dtype=torch.float32
+            )
+            new_centres = (shifted[keep, :2] + shifted[keep, 2:]) / 2.0
+            new_size = shifted[keep, 2:] - shifted[keep, :2]
+            kept_yolo = torch.cat(
+                [kept_labels[:, 0:1], new_centres / extent_mosaic, new_size / extent_mosaic],
+                dim=1,
+            )
+            all_labels.append(kept_yolo)
+        else:
+            all_labels.append(shifted[keep])
+
+    if all_labels:
+        combined = torch.cat(all_labels, dim=0)
+    else:
+        combined = labels_list[0][:0]
+
+    return canvas, combined
 
 
 def augment_image(image: torch.Tensor, mode: str) -> Tuple[torch.Tensor, torch.Tensor]:

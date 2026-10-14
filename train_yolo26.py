@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, List, Sequence, Tuple
 
 import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -28,7 +29,9 @@ from model_ema import DEFAULT_EMA_DECAY, ModelEMA, validate_ema_decay
 from models.yolo26_torch import build_yolo26, class_aware_nms
 from online_augmentation import (
     DEFAULT_ONLINE_AUGMENTATION,
+    MOSAIC_PRESETS,
     ONLINE_AUGMENTATION_CHOICES,
+    apply_mosaic,
     apply_online_augmentation,
     augment_image,
     transform_yolo_cxcywh,
@@ -122,39 +125,21 @@ class YoloDetectionDataset(Dataset):
             resize_mode=self.resize_mode,
         )
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
-        image_tensor, target_matrix = augment_image(image_tensor, self.online_augmentation)
 
         label_path = self.labels_dir / f"{image_path.stem}.txt"
-        labels = []
-        if label_path.exists():
-            for line_number, line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), start=1):
-                parts = line.strip().split()
-                if not parts:
-                    continue
-                if len(parts) != 5:
-                    raise ValueError(
-                        f"{label_path}:{line_number}: expected five-field YOLO detection label "
-                        "(class x_center y_center width height). Run preprocess_dataset.py to normalize polygon labels."
-                    )
-
-                try:
-                    class_id, x_center, y_center, width, height = (float(value) for value in parts)
-                except ValueError as exc:
-                    raise ValueError(f"{label_path}:{line_number}: label values must be numeric") from exc
-
-                if class_id != int(class_id) or not (0.0 <= x_center <= 1.0 and 0.0 <= y_center <= 1.0):
-                    raise ValueError(f"{label_path}:{line_number}: invalid class ID or normalized box center")
-                if not (0.0 < width <= 1.0 and 0.0 < height <= 1.0):
-                    raise ValueError(f"{label_path}:{line_number}: normalized box width and height must be in (0, 1]")
-
-                labels.append([class_id, x_center, y_center, width, height])
-
+        labels = self._load_yolo_labels(label_path)
         labels_tensor = (
             torch.tensor(labels, dtype=torch.float32)
             if labels
             else torch.zeros((0, 5), dtype=torch.float32)
         )
         model_targets = source_yolo_to_model_yolo(labels_tensor, transform)
+
+        # Mosaic presets need multiple images; they are handled at the dataset level.
+        if self.online_augmentation in MOSAIC_PRESETS:
+            return self._getitem_mosaic(index, image_tensor, model_targets)
+
+        image_tensor, target_matrix = augment_image(image_tensor, self.online_augmentation)
         model_targets, _ = transform_yolo_cxcywh(
             model_targets,
             target_matrix,
@@ -162,6 +147,82 @@ class YoloDetectionDataset(Dataset):
             int(image_tensor.shape[-1]),
         )
         return image_tensor, model_targets
+
+    def _load_yolo_labels(self, label_path: Path) -> list:
+        labels = []
+        if not label_path.exists():
+            return labels
+        for line_number, line in enumerate(label_path.read_text(encoding="utf-8").splitlines(), start=1):
+            parts = line.strip().split()
+            if not parts:
+                continue
+            if len(parts) != 5:
+                raise ValueError(
+                    f"{label_path}:{line_number}: expected five-field YOLO detection label "
+                    "(class x_center y_center width height). Run preprocess_dataset.py to normalize polygon labels."
+                )
+            try:
+                class_id, x_center, y_center, width, height = (float(value) for value in parts)
+            except ValueError as exc:
+                raise ValueError(f"{label_path}:{line_number}: label values must be numeric") from exc
+            if class_id != int(class_id) or not (0.0 <= x_center <= 1.0 and 0.0 <= y_center <= 1.0):
+                raise ValueError(f"{label_path}:{line_number}: invalid class ID or normalized box center")
+            if not (0.0 < width <= 1.0 and 0.0 < height <= 1.0):
+                raise ValueError(f"{label_path}:{line_number}: normalized box width and height must be in (0, 1]")
+            labels.append([class_id, x_center, y_center, width, height])
+        return labels
+
+    def _getitem_mosaic(
+        self,
+        index: int,
+        image_tensor: torch.Tensor,
+        model_targets: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build a 2x2 mosaic by sampling additional images from the dataset."""
+        indices = [index]
+        while len(indices) < 4:
+            extra = int(torch.randint(0, len(self.image_paths), (1,)).item())
+            indices.append(extra)
+
+        images = [image_tensor]
+        targets_list = [model_targets]
+
+        for idx in indices[1:]:
+            path = self.image_paths[idx]
+            img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img, _ = resize_image(
+                img, target_height=self.imgsz, target_width=self.imgsz, resize_mode=self.resize_mode,
+            )
+            img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
+            lp = self.labels_dir / f"{path.stem}.txt"
+            lbls = self._load_yolo_labels(lp)
+            lbl_t = torch.tensor(lbls, dtype=torch.float32) if lbls else torch.zeros((0, 5), dtype=torch.float32)
+            # Resize-transform the labels into model space (same as primary image).
+            _, extra_transform = resize_image(
+                np.zeros((10, 10, 3), dtype=np.uint8),
+                target_height=self.imgsz, target_width=self.imgsz, resize_mode=self.resize_mode,
+            )
+            lbl_t = source_yolo_to_model_yolo(lbl_t, extra_transform)
+            images.append(img_t)
+            targets_list.append(lbl_t)
+
+        degrees, translate, scale, shear = MOSAIC_PRESETS[self.online_augmentation]
+        mosaic, combined = apply_mosaic(
+            images,
+            targets_list,
+            self.imgsz,
+            self.imgsz,
+            probability=1.0,  # always fire when this branch is reached
+            degrees=degrees,
+            translate=translate,
+            scale=scale,
+            shear=shear,
+        )
+        return mosaic, combined
 
 
 def collate_fn(batch: Sequence[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, List[torch.Tensor]]:

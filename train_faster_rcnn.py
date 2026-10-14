@@ -30,7 +30,9 @@ from model_ema import DEFAULT_EMA_DECAY, ModelEMA, validate_ema_decay
 from models.faster_rcnn import build_faster_rcnn
 from online_augmentation import (
     DEFAULT_ONLINE_AUGMENTATION,
+    MOSAIC_PRESETS,
     ONLINE_AUGMENTATION_CHOICES,
+    apply_mosaic,
     apply_online_augmentation,
     augment_image,
     transform_boxes_xyxy,
@@ -176,16 +178,19 @@ class FasterRCNNDataset(Dataset):
             resize_mode=self.resize_mode,
         )
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
-        image_tensor, target_matrix = augment_image(image_tensor, self.online_augmentation)
 
         label_path = self.labels_dir / f"{image_path.stem}.txt"
         raw = read_yolo_label(label_path, self.num_classes)
         converted = source_yolo_to_model_xyxy(raw, transform)
         keep = (converted[:, 2] > converted[:, 0]) & (converted[:, 3] > converted[:, 1])
-
         boxes_xyxy = converted[keep]
         labels = raw[:, 0].long()[keep] + 1
 
+        # Mosaic presets need multiple images; handled at the dataset level.
+        if self.online_augmentation in MOSAIC_PRESETS:
+            return self._getitem_mosaic(index, image_tensor, boxes_xyxy, labels)
+
+        image_tensor, target_matrix = augment_image(image_tensor, self.online_augmentation)
         height, width = int(image_tensor.shape[-2]), int(image_tensor.shape[-1])
         boxes_xyxy, affine_keep = transform_boxes_xyxy(
             boxes_xyxy, target_matrix, height, width
@@ -194,6 +199,101 @@ class FasterRCNNDataset(Dataset):
         labels = labels[affine_keep]
 
         return image_tensor, {"boxes": boxes_xyxy, "labels": labels}
+
+    def _getitem_mosaic(
+        self,
+        index: int,
+        image_tensor: torch.Tensor,
+        boxes_xyxy: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Build a 2x2 mosaic by sampling additional images from the dataset."""
+        indices = [index]
+        while len(indices) < 4:
+            extra = int(torch.randint(0, len(self.image_paths), (1,)).item())
+            indices.append(extra)
+
+        images = [image_tensor]
+        boxes_list = [boxes_xyxy]
+        labels_list = [labels]
+
+        for idx in indices[1:]:
+            path = self.image_paths[idx]
+            img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img, extra_transform = resize_image(
+                img, target_height=self.imgsz, target_width=self.imgsz, resize_mode=self.resize_mode,
+            )
+            img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
+            lp = self.labels_dir / f"{path.stem}.txt"
+            raw = read_yolo_label(lp, self.num_classes)
+            conv = source_yolo_to_model_xyxy(raw, extra_transform)
+            k = (conv[:, 2] > conv[:, 0]) & (conv[:, 3] > conv[:, 1])
+            boxes_list.append(conv[k])
+            labels_list.append(raw[:, 0].long()[k] + 1)
+            images.append(img_t)
+
+        # Apply the mosaic and get back combined boxes; keep label alignment by
+        # re-deriving per-image kept masks via the returned count.
+        degrees, translate, scale, shear = MOSAIC_PRESETS[self.online_augmentation]
+        # We call apply_mosaic for the image composite; for labels we track the
+        # per-image keep masks ourselves.
+        from online_augmentation import (
+            AFFINE_BORDER_VALUE,
+            MIN_AFFINE_BOX_AREA_FRACTION,
+            sample_affine_matrix,
+        )
+
+        canvas = torch.zeros((3, self.imgsz, self.imgsz), dtype=image_tensor.dtype)
+        half_h = self.imgsz // 2
+        half_w = self.imgsz // 2
+
+        all_boxes: list = []
+        all_labels: list = []
+
+        for i, (img, boxes, lbls) in enumerate(zip(images, boxes_list, labels_list)):
+            qx = (i % 2) * half_w
+            qy = (i // 2) * half_h
+
+            matrix = sample_affine_matrix(half_h, half_w, degrees, translate, scale, shear)
+
+            source = img.detach().to(dtype=torch.float32).permute(1, 2, 0).numpy() * 255.0
+            source = np.clip(source, 0, 255).astype(np.uint8)
+            warped = cv2.warpAffine(
+                source, matrix.numpy()[:2], (half_w, half_h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(AFFINE_BORDER_VALUE,) * 3,
+            )
+            canvas[:, qy:qy + half_h, qx:qx + half_w] = (
+                torch.from_numpy(warped).permute(2, 0, 1).to(canvas.dtype) / 255.0
+            )
+
+            if boxes.numel() == 0:
+                continue
+
+            transformed, keep = transform_boxes_xyxy(
+                boxes, matrix, half_h, half_w, MIN_AFFINE_BOX_AREA_FRACTION
+            )
+            shifted = transformed.clone()
+            shifted[:, 0] += qx
+            shifted[:, 2] += qx
+            shifted[:, 1] += qy
+            shifted[:, 3] += qy
+            all_boxes.append(shifted[keep])
+            all_labels.append(lbls[keep])
+
+        if all_boxes:
+            final_boxes = torch.cat(all_boxes, dim=0)
+            final_labels = torch.cat(all_labels, dim=0)
+        else:
+            final_boxes = torch.zeros((0, 4), dtype=torch.float32)
+            final_labels = torch.zeros((0,), dtype=torch.long)
+
+        return canvas, {"boxes": final_boxes, "labels": final_labels}
 
 
 def collate_fn(
