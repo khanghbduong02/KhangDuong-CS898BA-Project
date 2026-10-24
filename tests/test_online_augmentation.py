@@ -811,7 +811,68 @@ def test_affine_strength_presets_keep_targets_valid_and_reproducible() -> None:
             assert torch.equal(first_labels, second_labels)
 
 
-def main() -> None:
+def test_mosaic_presets_are_valid_and_ordered() -> None:
+    """Mosaic presets must be valid, ordered strictly by increasing strength."""
+    assert set(MOSAIC_PRESETS) == {"mosaic", "mosaic_medium", "mosaic_strong"}
+
+    names = list(MOSAIC_PRESETS)
+    strengths = [MOSAIC_PRESETS[n] for n in names]
+    assert strengths == sorted(strengths, key=lambda s: (s[0], s[1], s[2], s[3]))
+
+    for name, (degrees, translate, scale, shear) in MOSAIC_PRESETS.items():
+        assert degrees >= 0.0 and translate >= 0.0 and scale >= 0.0 and shear >= 0.0
+        assert 0.0 <= scale <= 1.0
+        assert 0.0 <= translate <= 0.15
+
+    # Each call must be reproducible for a fixed seed.
+    img = torch.rand(3, 960, 960)
+    lbl = torch.tensor([[0.5, 0.5, 0.5, 0.5, 1.0]])
+    canvas_a, combined_a = apply_mosaic(
+        [img, img, img, img], [lbl, lbl, lbl, lbl], 960, 960,
+        probability=1.0, degrees=MOSAIC_PRESETS["mosaic"][0],
+        translate=MOSAIC_PRESETS["mosaic"][1], scale=MOSAIC_PRESETS["mosaic"][2],
+        shear=MOSAIC_PRESETS["mosaic"][3],
+    )
+    torch.manual_seed(7)
+    canvas_b, combined_b = apply_mosaic(
+        [img, img, img, img], [lbl, lbl, lbl, lbl], 960, 960,
+        probability=1.0, degrees=MOSAIC_PRESETS["mosaic"][0],
+        translate=MOSAIC_PRESETS["mosaic"][1], scale=MOSAIC_PRESETS["mosaic"][2],
+        shear=MOSAIC_PRESETS["mosaic"][3],
+    )
+    assert torch.equal(canvas_a, canvas_b)
+    assert torch.equal(combined_a, combined_b)
+
+
+def test_mosaic_datasets_keep_targets_aligned_and_are_reproducible() -> None:
+    """Mosaic preserves box/label alignment, image geometry, and seed reproducibility."""
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        split_root = Path(temporary_directory) / "train"
+        _write_detection_split(split_root)
+
+        yolo_plain = YoloDetectionDataset(split_root, imgsz=960)
+        yolo_mosaic = YoloDetectionDataset(split_root, imgsz=960, online_augmentation="mosaic")
+        _, yolo_plain_labels = yolo_plain[0]
+        plain_classes = set(yolo_plain_labels[:, 0].tolist())
+
+        for seed in range(6):
+            torch.manual_seed(seed)
+            mosaic_image, mosaic_labels = yolo_mosaic[0]
+            assert torch.isfinite(mosaic_image).all()
+            assert 0.0 <= float(mosaic_image.min()) <= float(mosaic_image.max()) <= 1.0
+            assert (mosaic_labels[:, 1] >= 0.0).all() and (mosaic_labels[:, 1] <= 1.0).all()
+            assert (mosaic_labels[:, 2] >= 0.0).all() and (mosaic_labels[:, 2] <= 1.0).all()
+            assert (mosaic_labels[:, 3] > 0.0).all() and (mosaic_labels[:, 4] > 0.0).all()
+            assert set(mosaic_labels[:, 0].tolist()).issubset(plain_classes)
+
+        # Identical seeds reproduce identical samples for the mosaic preset.
+        torch.manual_seed(41)
+        first_image, first_labels = yolo_mosaic[0]
+        torch.manual_seed(41)
+        second_image, second_labels = yolo_mosaic[0]
+        assert torch.equal(first_image, second_image)
+        assert torch.equal(first_labels, second_labels)
+
     test_flip_targets_match_the_mirrored_image()
     print("flip_target_geometry: passed")
     test_hflip_policy_is_reproducible_and_respects_probability()

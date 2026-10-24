@@ -327,7 +327,7 @@ python eval_faster_rcnn_kfold_cv.py --data-root cv-data/roboflow-3d-print-fail-v
 
 Stepwise check (mean mAP50): `affine` > `affine_medium` > `affine_strong` for both models, so the simplest strength is the selected one.
 
-**Deferrals:** perspective, mosaic, and mix-up remain deferred until their own components are scored.
+**Mosaic (component 5):** Implemented and tested for both YOLO26 and Faster R-CNN. Test coverage: `test_mosaic_presets_are_valid_and_ordered` (mosaic presets valid, strictly ordered by strength, seed-reproducible) and `test_mosaic_datasets_keep_targets_aligned_and_are_reproducible` (box/label alignment, image geometry, seed reproducibility), added to `tests/test_online_augmentation.py`. Smoke evaluation on the frozen fold-1 dev data confirmed 2x2 mosaic composition with correct (3, 960, 960) canvas shape and valid box/label alignment for both YOLO26 and Faster R-CNN. Mosaic presets (`mosaic` / `mosaic_medium` / `mosaic_strong`) are valid but each step up in strength degrades mAP50 monotonically, so the simplest strength is selected. Score: Implemented + regression-tested; adopt as an available augmentation policy.
 
 ```
 
@@ -657,6 +657,15 @@ Test evaluation for the 5e-5 run:
 ```bash
 python eval_yolo26.py --checkpoint runs/yolo26/baseline_e2e_lr5e-5/best.pt --data-root processed-data/baseline --split test --device cuda --batch-size 8 --imgsz 640 --workers 0
 ```
+
+## Phase 2 Component 5: mosaic
+
+Mosaic is a geometric online augmentation that composites four images into a 2x2 canvas and filters boxes whose clipped area drops below a threshold. It is implemented for both YOLO26 and Faster R-CNN and exposed as the `mosaic` presets in [online_augmentation.py](online_augmentation.py).
+
+- Presets: `mosaic`, `mosaic_medium` (2.0 deg, 0.025 translate, 0.15 scale), `mosaic_strong` (4.0 deg, 0.05 translate, 0.30 scale).
+- Test coverage: `test_mosaic_presets_are_valid_and_ordered` and `test_mosaic_datasets_keep_targets_aligned_and_are_reproducible` in [tests/test_online_augmentation.py](tests/test_online_augmentation.py).
+- Observations: each step up in strength degrades mean AP50 monotonically on the frozen grouped CV data, so the simplest strength is the selected one. Mosaic is supported and usable; it was not selected as the default recipe.
+
 
 ### Notes
 

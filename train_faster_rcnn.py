@@ -236,11 +236,9 @@ class FasterRCNNDataset(Dataset):
             labels_list.append(raw[:, 0].long()[k] + 1)
             images.append(img_t)
 
-        # Apply the mosaic and get back combined boxes; keep label alignment by
-        # re-deriving per-image kept masks via the returned count.
+        # Manually composite the mosaic and transform boxes + labels together so
+        # class IDs stay aligned with their boxes through the keep-mask filter.
         degrees, translate, scale, shear = MOSAIC_PRESETS[self.online_augmentation]
-        # We call apply_mosaic for the image composite; for labels we track the
-        # per-image keep masks ourselves.
         from online_augmentation import (
             AFFINE_BORDER_VALUE,
             MIN_AFFINE_BOX_AREA_FRACTION,
@@ -294,6 +292,7 @@ class FasterRCNNDataset(Dataset):
             final_labels = torch.zeros((0,), dtype=torch.long)
 
         return canvas, {"boxes": final_boxes, "labels": final_labels}
+
 
 
 def collate_fn(

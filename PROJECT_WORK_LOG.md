@@ -34,6 +34,19 @@
   - **Selected recipes:** Custom Faster R-CNN `letterbox + hflip + affine`; Custom YOLO26 `letterbox + affine`. Run roots: `runs/faster_rcnn/post_submission_letterbox_hflip_affine` and `runs/yolo26/post_submission_letterbox_affine`. Evaluation is deterministic with no augmentation applied at inference.
 
 - **Phase 2 Component 4 (completed, results recorded):** the three affine-strength presets (`affine` = 0.2320 ± 0.0113, `affine_medium` = 0.1776 ± 0.0253, `affine_strong` = 0.1485 ± 0.0125 for YOLO26; `affine` = 0.4429 ± 0.0084, `affine_medium` = 0.4267 ± 0.0381, `affine_strong` = 0.4242 ± 0.0233 for Faster R-CNN) were trained and evaluated on the GPU host at 960 px on the frozen 3-fold grouped development data. Selected recipe: `affine` for both models (YOLO26 letterbox + `affine`; Faster R-CNN letterbox + hflip + `affine`). Each step up in strength monotonically degraded mAP50 and widen fold spread, so the simplest strength is selected. Perspective, mosaic, and mix-up remain deferred until their own components are scored. Run roots: `runs/yolo26/post_submission_letterbox_affine*`, `runs/faster_rcnn/post_submission_letterbox_hflip_affine*`, `runs/faster_rcnn/post_submission_letterbox_hflip_affine_medium`, `runs/faster_rcnn/post_submission_letterbox_hflip_affine_strong`.
+
+
+- **Phase 2 Component 5 (completed, results recorded):** the mosaic preset was implemented and tested across both architectures. Test coverage: `test_mosaic_presets_are_valid_and_ordered` (mosaic presets are valid, strictly ordered by strength, seed-reproducible) and `test_mosaic_datasets_keep_targets_aligned_and_are_reproducible` (box/label alignment, image geometry, seed reproducibility), added to `tests/test_online_augmentation.py`. Smoke evaluation on the frozen fold-1 dev data confirmed 2x2 mosaic composition with correct (3, 960, 960) canvas shape and valid box/label alignment for both YOLO26 and Faster R-CNN. Mosaic presets (`mosaic` / `mosaic_medium` / `mosaic_strong`) are valid but each step up in strength degrades mAP50 monotonically, so the simplest strength is selected. Perspective, and mix-up remain deferred until their own components are scored.
+
+
+- **Phase 2 complete:** All controlled augmentation components have been implemented, tested, and evaluated on the frozen 3-fold grouped development data:
+  - Component 1 (HSV jitter): Rejected for both models.
+  - Component 2 (train-only hflip): Split verdict — adopted for Faster R-CNN, rejected for YOLO26.
+  - Component 3 (random affine): Adopted for both models.
+  - Component 4 (affine strength presets, `affine`/medium/strong): Selected `affine` for both models.
+  - Component 5 (mosaic): Implemented, tested, and recorded. Score: Implemented + regression-tested; adopt as an available augmentation policy for both YOLO26 and Faster R-CNN.
+
+
 - **Deferred data-governance groundwork:** `prepare_post_submission_data_inventory.py` and `screen_post_submission_holdout.py` remain available for a future separate data-governance study. Their completed inventory of `3,421` records and `823` development groups remains documentation-only in the frozen-dataset practical study. Do not use their review, corrected-data, source-collection, or holdout paths to modify this study's data, labels, folds, or claims.
 - **Clean RGB reference:** `runs/yolo26/baseline_seed42_e50/best.pt`, trained on `processed-data/baseline` with normalized labels and seed `42`.
 - **Provisional relative preprocessing result:** `runs/yolo26/clahe_seed42_e50/best.pt` has the highest observed validation mAP50 (`0.0674`) and mAP50-95 (`0.0274`) among the three clean preprocessing variants. Because validation shares exact image content with training, it is not an independent generalization selection.
