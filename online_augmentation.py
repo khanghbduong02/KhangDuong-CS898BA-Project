@@ -60,6 +60,11 @@ ONLINE_AUGMENTATION_CHOICES = (
     *MOSAIC_PRESETS,
 )
 
+# A policy may compose components with "+" (for example "mosaic+hflip+hsv").
+# Components are kept in the fixed Ultralytics order: mosaic, affine, mirror, appearance.
+COMPOSITION_SEPARATOR = "+"
+AUGMENTATION_COMPONENT_ORDER = (*MOSAIC_PRESETS, *AFFINE_PRESETS, "hflip", "hsv", "photometric")
+
 # Ultralytics pads warped regions with mid-gray.
 AFFINE_BORDER_VALUE = 114
 
@@ -78,13 +83,69 @@ DEFAULT_HSV_S = 0.70   # Saturation variation fraction
 DEFAULT_HSV_V = 0.40   # Value variation fraction
 
 
+def _augmentation_family(name: str) -> str:
+    """Return the component type, used to reject ambiguous compositions."""
+    if name in MOSAIC_PRESETS:
+        return "mosaic"
+    if name in AFFINE_PRESETS:
+        return "affine"
+    if name == "hflip":
+        return "hflip"
+    if name in ("hsv", "photometric"):
+        return "appearance"
+    raise ValueError(f"Unknown augmentation component {name!r}")
+
+
+def split_augmentation_spec(mode: str) -> Tuple[str, ...]:
+    """Split a policy such as ``mosaic+hflip+hsv`` into its components."""
+    return tuple(mode.split(COMPOSITION_SEPARATOR))
+
+
 def validate_online_augmentation(mode: str) -> str:
-    """Validate and normalize a training-only augmentation policy."""
-    if mode not in ONLINE_AUGMENTATION_CHOICES:
+    """Validate and canonicalize a training-only augmentation policy.
+
+    A policy is ``none`` or one or more component names joined by ``+``, for example
+    ``mosaic+hflip+hsv``. Each component family (mosaic, affine, flip, appearance) may
+    appear at most once, and the returned string uses the fixed Ultralytics order.
+    """
+    if mode == "none":
+        return mode
+    parts = split_augmentation_spec(mode)
+    if any(not part for part in parts) or len(parts) != len(set(parts)):
         raise ValueError(
-            f"--online-augmentation must be one of {ONLINE_AUGMENTATION_CHOICES}, got {mode!r}"
+            f"--online-augmentation must not contain empty or repeated components, got {mode!r}"
         )
-    return mode
+    families = []
+    for part in parts:
+        if part not in ONLINE_AUGMENTATION_CHOICES or part == "none":
+            raise ValueError(
+                f"--online-augmentation components must be chosen from {ONLINE_AUGMENTATION_CHOICES}, "
+                f"got {part!r} in {mode!r}"
+            )
+        families.append(_augmentation_family(part))
+    if len(families) != len(set(families)):
+        raise ValueError(
+            f"--online-augmentation may use each component type once at most, got {mode!r}"
+        )
+    return COMPOSITION_SEPARATOR.join(sorted(parts, key=AUGMENTATION_COMPONENT_ORDER.index))
+
+
+def mosaic_component(mode: str) -> str | None:
+    """Return the mosaic preset in a policy, or ``None`` when it has none."""
+    for part in split_augmentation_spec(validate_online_augmentation(mode)):
+        if part in MOSAIC_PRESETS:
+            return part
+    return None
+
+
+def strip_mosaic(mode: str) -> str:
+    """Return the policy without its mosaic component (``none`` if nothing remains)."""
+    parts = [
+        part
+        for part in split_augmentation_spec(validate_online_augmentation(mode))
+        if part not in MOSAIC_PRESETS
+    ]
+    return COMPOSITION_SEPARATOR.join(parts) if parts else "none"
 
 
 def _sample_symmetric_factor(delta: float, image: torch.Tensor) -> torch.Tensor:
@@ -533,22 +594,36 @@ def augment_image(image: torch.Tensor, mode: str) -> Tuple[torch.Tensor, torch.T
         raise ValueError("Online augmentation requires finite image values in [0, 1]")
 
     width = int(image.shape[-1])
-    if mode == "none":
-        return image, identity_matrix()
-    if mode == "hflip":
-        flipped, applied = apply_horizontal_flip(image)
-        return flipped, horizontal_flip_matrix(width) if applied else identity_matrix()
-    if mode in AFFINE_PRESETS:
-        degrees, translate, scale, shear = AFFINE_PRESETS[mode]
-        return apply_affine(
-            image,
-            degrees=degrees,
-            translate=translate,
-            scale=scale,
-            shear=shear,
-        )
+    result = image
+    matrix = identity_matrix()
+    appearance: list = []
+    for component in split_augmentation_spec(mode):
+        if component in MOSAIC_PRESETS:
+            raise ValueError(
+                "The mosaic component is dataset-level; composite it with apply_mosaic() "
+                "before calling augment_image() on the finished canvas."
+            )
+        if component in AFFINE_PRESETS:
+            degrees, translate, scale, shear = AFFINE_PRESETS[component]
+            result, component_matrix = apply_affine(
+                result,
+                degrees=degrees,
+                translate=translate,
+                scale=scale,
+                shear=shear,
+            )
+            matrix = component_matrix @ matrix
+        elif component == "hflip":
+            result, applied = apply_horizontal_flip(result)
+            if applied:
+                matrix = horizontal_flip_matrix(width) @ matrix
+        else:
+            appearance.append(component)
 
-    return apply_online_augmentation(image, mode), identity_matrix()
+    # Appearance changes are applied after all geometry, matching Ultralytics order.
+    for component in appearance:
+        result = apply_online_augmentation(result, component)
+    return result, matrix
 
 
 def apply_online_augmentation(image: torch.Tensor, mode: str) -> torch.Tensor:
@@ -567,25 +642,29 @@ def apply_online_augmentation(image: torch.Tensor, mode: str) -> torch.Tensor:
         raise ValueError("Online augmentation requires finite image values in [0, 1]")
     if mode == "none":
         return image
-    if mode in GEOMETRIC_ONLINE_AUGMENTATIONS:
-        raise ValueError(
-            f"Online augmentation {mode!r} changes geometry, so it cannot be applied through this "
-            "appearance-only helper. Use augment_image() and transform the targets with the returned flag."
-        )
-    if mode == "hsv":
-        return apply_hsv_augmentation(image)
+    components = split_augmentation_spec(mode)
+    for component in components:
+        if component in GEOMETRIC_ONLINE_AUGMENTATIONS:
+            raise ValueError(
+                f"Online augmentation {mode!r} changes geometry, so it cannot be applied through this "
+                "appearance-only helper. Use augment_image() and transform the targets with the returned matrix."
+            )
 
-    augmented = image.clone()
-    augmented = (augmented * _sample_symmetric_factor(PHOTOMETRIC_BRIGHTNESS_DELTA, augmented)).clamp(0.0, 1.0)
+    augmented = image
+    for component in components:
+        if component == "hsv":
+            augmented = apply_hsv_augmentation(augmented)
+            continue
 
-    channel_mean = augmented.mean(dim=(1, 2), keepdim=True)
-    augmented = (
-        (augmented - channel_mean) * _sample_symmetric_factor(PHOTOMETRIC_CONTRAST_DELTA, augmented)
-        + channel_mean
-    ).clamp(0.0, 1.0)
-
-    gamma = _sample_symmetric_factor(PHOTOMETRIC_GAMMA_DELTA, augmented)
-    augmented = augmented.pow(gamma)
-    augmented = augmented + torch.randn_like(augmented) * PHOTOMETRIC_NOISE_STD
-    return augmented.clamp(0.0, 1.0)
+        augmented = (augmented * _sample_symmetric_factor(PHOTOMETRIC_BRIGHTNESS_DELTA, augmented)).clamp(0.0, 1.0)
+        channel_mean = augmented.mean(dim=(1, 2), keepdim=True)
+        augmented = (
+            (augmented - channel_mean) * _sample_symmetric_factor(PHOTOMETRIC_CONTRAST_DELTA, augmented)
+            + channel_mean
+        ).clamp(0.0, 1.0)
+        gamma = _sample_symmetric_factor(PHOTOMETRIC_GAMMA_DELTA, augmented)
+        augmented = augmented.pow(gamma)
+        augmented = augmented + torch.randn_like(augmented) * PHOTOMETRIC_NOISE_STD
+        augmented = augmented.clamp(0.0, 1.0)
+    return augmented
 

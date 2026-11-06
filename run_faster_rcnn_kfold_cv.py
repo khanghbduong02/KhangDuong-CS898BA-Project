@@ -18,6 +18,7 @@ from model_ema import DEFAULT_EMA_DECAY, validate_ema_decay
 from online_augmentation import (
     DEFAULT_ONLINE_AUGMENTATION,
     ONLINE_AUGMENTATION_CHOICES,
+    mosaic_component,
     validate_online_augmentation,
 )
 from training_control import (
@@ -59,6 +60,7 @@ def training_settings(args: argparse.Namespace, num_classes: int) -> dict[str, A
         "balanced_sampling": args.balanced_sampling,
         "balanced_sampling_power": args.balanced_sampling_power,
         "online_augmentation": args.online_augmentation,
+        "close_mosaic_epochs": args.close_mosaic_epochs,
         "reduce_lr_patience": args.reduce_lr_patience,
         "reduce_lr_factor": args.reduce_lr_factor,
         "reduce_lr_cooldown": args.reduce_lr_cooldown,
@@ -119,6 +121,8 @@ def build_train_command(
         str(args.balanced_sampling_power),
         "--online-augmentation",
         args.online_augmentation,
+        "--close-mosaic-epochs",
+        str(args.close_mosaic_epochs),
         "--reduce-lr-patience",
         str(args.reduce_lr_patience),
         "--reduce-lr-factor",
@@ -314,9 +318,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--balanced-sampling-power", type=float, default=1.0)
     parser.add_argument(
         "--online-augmentation",
-        choices=ONLINE_AUGMENTATION_CHOICES,
+        # Composed policies such as "mosaic+hflip+hsv" are validated after parsing.
         default=DEFAULT_ONLINE_AUGMENTATION,
         help="Training-only in-memory augmentation policy passed to every fold",
+    )
+    parser.add_argument(
+        "--close-mosaic-epochs",
+        type=int,
+        default=0,
+        help="Disable the mosaic component for the final N epochs (Ultralytics close_mosaic)",
     )
     add_plateau_early_stopping_arguments(parser)
     add_epoch_lr_schedule_arguments(parser)
@@ -360,6 +370,10 @@ def main() -> None:
     validate_training_control_compatibility(plateau_config, epoch_schedule_config)
     checkpoint_selection = validate_checkpoint_selection(args.checkpoint_selection)
     args.online_augmentation = validate_online_augmentation(args.online_augmentation)
+    if not 0 <= args.close_mosaic_epochs < args.epochs:
+        raise ValueError("--close-mosaic-epochs must be in [0, epochs)")
+    if args.close_mosaic_epochs and mosaic_component(args.online_augmentation) is None:
+        raise ValueError("--close-mosaic-epochs requires a policy with a mosaic component")
     args.resize_mode = validate_resize_mode(args.resize_mode)
     args.ema_decay = validate_ema_decay(args.ema_decay)
     if args.ema_decay > 0.0 and checkpoint_selection != "map50":

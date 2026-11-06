@@ -34,6 +34,8 @@ from online_augmentation import (
     apply_mosaic,
     apply_online_augmentation,
     augment_image,
+    mosaic_component,
+    strip_mosaic,
     transform_yolo_cxcywh,
     validate_online_augmentation,
 )
@@ -108,6 +110,10 @@ class YoloDetectionDataset(Dataset):
 
         self.image_paths = image_paths
 
+    def set_online_augmentation(self, mode: str) -> None:
+        """Replace the training policy; used to disable mosaic for the final epochs."""
+        self.online_augmentation = validate_online_augmentation(mode)
+
     def __len__(self) -> int:
         return len(self.image_paths)
 
@@ -136,7 +142,7 @@ class YoloDetectionDataset(Dataset):
         model_targets = source_yolo_to_model_yolo(labels_tensor, transform)
 
         # Mosaic presets need multiple images; they are handled at the dataset level.
-        if self.online_augmentation in MOSAIC_PRESETS:
+        if mosaic_component(self.online_augmentation) is not None:
             return self._getitem_mosaic(index, image_tensor, model_targets)
 
         image_tensor, target_matrix = augment_image(image_tensor, self.online_augmentation)
@@ -210,7 +216,7 @@ class YoloDetectionDataset(Dataset):
             images.append(img_t)
             targets_list.append(lbl_t)
 
-        degrees, translate, scale, shear = MOSAIC_PRESETS[self.online_augmentation]
+        degrees, translate, scale, shear = MOSAIC_PRESETS[mosaic_component(self.online_augmentation)]
         mosaic, combined = apply_mosaic(
             images,
             targets_list,
@@ -222,6 +228,16 @@ class YoloDetectionDataset(Dataset):
             scale=scale,
             shear=shear,
         )
+        # Apply any non-mosaic components to the finished canvas.
+        residual = strip_mosaic(self.online_augmentation)
+        if residual != "none":
+            mosaic, target_matrix = augment_image(mosaic, residual)
+            combined, _ = transform_yolo_cxcywh(
+                combined,
+                target_matrix,
+                int(mosaic.shape[-2]),
+                int(mosaic.shape[-1]),
+            )
         return mosaic, combined
 
 
@@ -803,13 +819,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--online-augmentation",
-        choices=ONLINE_AUGMENTATION_CHOICES,
+        # Composed policies such as "mosaic+hflip+hsv" are validated after parsing.
         default=DEFAULT_ONLINE_AUGMENTATION,
         help=(
             "Training-only in-memory image augmentation: hsv applies Ultralytics-aligned "
             "HSV jitter; photometric applies conservative brightness, contrast, gamma, and noise. "
-            "Validation always uses none; boxes, labels, and source files are unchanged"
+            "Compose components with '+' (e.g. mosaic+hflip+hsv). Validation always uses none; "
+            "boxes, labels, and source files are unchanged"
         ),
+    )
+    parser.add_argument(
+        "--close-mosaic-epochs",
+        type=int,
+        default=0,
+        help="Disable the mosaic component for the final N epochs, mirroring Ultralytics close_mosaic",
     )
     parser.add_argument("--device", type=str, default="cuda", help="Training device, e.g. cuda or cuda:0")
     parser.add_argument("--scale", type=str, default="n", help="YOLO26 scale variant")
@@ -879,6 +902,10 @@ def main() -> None:
     if args.reg_max <= 0:
         raise ValueError("--reg-max must be positive")
     args.online_augmentation = validate_online_augmentation(args.online_augmentation)
+    if not 0 <= args.close_mosaic_epochs < args.epochs:
+        raise ValueError("--close-mosaic-epochs must be in [0, epochs)")
+    if args.close_mosaic_epochs and mosaic_component(args.online_augmentation) is None:
+        raise ValueError("--close-mosaic-epochs requires a policy with a mosaic component")
     args.resize_mode = validate_resize_mode(args.resize_mode)
     args.ema_decay = validate_ema_decay(args.ema_decay)
     training_control_config = plateau_early_stopping_config_from_args(args)
@@ -1034,7 +1061,15 @@ def main() -> None:
             f"image_counts=({count_summary}) background_images={background_images}"
         )
 
+    close_mosaic_at = args.epochs - args.close_mosaic_epochs + 1 if args.close_mosaic_epochs else None
     for epoch in range(1, args.epochs + 1):
+        if epoch == close_mosaic_at:
+            train_dataset.set_online_augmentation(strip_mosaic(args.online_augmentation))
+            print(
+                f"close_mosaic: mosaic disabled from epoch {epoch}/{args.epochs} "
+                f"(training policy={train_dataset.online_augmentation})",
+                flush=True,
+            )
         epoch_schedule_step = (
             epoch_lr_scheduler.set_epoch(epoch) if epoch_lr_scheduler is not None else None
         )

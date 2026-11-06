@@ -668,7 +668,7 @@ Mosaic is a geometric online augmentation that composites four images into a 2x2
 
 - Presets: `mosaic`, `mosaic_medium` (2.0 deg, 0.025 translate, 0.15 scale), `mosaic_strong` (4.0 deg, 0.05 translate, 0.30 scale).
 - Test coverage: `test_mosaic_presets_are_valid_and_ordered` and `test_mosaic_datasets_keep_targets_aligned_and_are_reproducible` in [tests/test_online_augmentation.py](tests/test_online_augmentation.py).
-- Observations: each step up in strength degrades mean AP50 monotonically on the frozen grouped CV data, so the simplest strength is the selected one. Mosaic is supported and usable; it was not selected as the default recipe.
+- Observations: no three-fold score was ever recorded for mosaic, so no strength ordering is claimed. Mosaic is supported and usable; it was never part of the selected recipe. The earlier wording that mosaic strength degraded mAP50 was carried over from the affine sweep by mistake and is withdrawn.
 
 
 ### Notes

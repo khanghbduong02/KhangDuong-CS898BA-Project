@@ -19,7 +19,11 @@ from online_augmentation import (
     apply_affine,
     apply_horizontal_flip,
     apply_online_augmentation,
+    MOSAIC_PRESETS,
+    apply_mosaic,
     augment_image,
+    mosaic_component,
+    strip_mosaic,
     flip_boxes_xyxy,
     flip_yolo_cxcywh,
     horizontal_flip_matrix,
@@ -873,6 +877,79 @@ def test_mosaic_datasets_keep_targets_aligned_and_are_reproducible() -> None:
         assert torch.equal(first_image, second_image)
         assert torch.equal(first_labels, second_labels)
 
+def test_augmentation_composition_validates_and_canonicalizes() -> None:
+    """Composed policies must validate, canonicalize, and reject ambiguous families."""
+    assert validate_online_augmentation("mosaic+affine+hflip+hsv") == "mosaic+affine+hflip+hsv"
+    assert validate_online_augmentation("hsv+hflip+affine+mosaic") == "mosaic+affine+hflip+hsv"
+    assert validate_online_augmentation("mosaic_medium+hflip") == "mosaic_medium+hflip"
+    assert mosaic_component("mosaic_medium+hflip") == "mosaic_medium"
+    assert mosaic_component("affine") is None
+    assert strip_mosaic("mosaic_medium+hflip+hsv") == "hflip+hsv"
+    assert strip_mosaic("mosaic") == "none"
+
+    for invalid in (
+        "mosaic+none",
+        "mosaic+mosaic_medium",
+        "affine+affine_medium",
+        "hsv+photometric",
+        "mosaic+",
+        "+hflip",
+        "mosaic+hflip+hflip",
+    ):
+        try:
+            validate_online_augmentation(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected ValueError for composition {invalid!r}")
+
+
+def test_composed_policy_and_close_mosaic_keep_targets_valid() -> None:
+    """A composed mosaic policy must stay aligned, and close_mosaic must strip it."""
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        split_root = Path(temporary_directory) / "train"
+        _write_detection_split(split_root)
+
+        composed = "mosaic+hflip+hsv"
+        yolo = YoloDetectionDataset(split_root, imgsz=64, online_augmentation=composed)
+        faster = FasterRCNNDataset(
+            split_root, imgsz=64, num_classes=2, online_augmentation=composed
+        )
+        assert yolo.online_augmentation == composed
+        assert mosaic_component(yolo.online_augmentation) == "mosaic"
+
+        torch.manual_seed(3)
+        image, labels = yolo[0]
+        assert image.shape == (3, 64, 64)
+        assert torch.isfinite(image).all()
+        assert 0.0 <= float(image.min()) <= float(image.max()) <= 1.0
+        if labels.numel():
+            assert (labels[:, 1:] >= 0.0).all() and (labels[:, 1:] <= 1.0).all()
+            assert (labels[:, 3] > 0.0).all() and (labels[:, 4] > 0.0).all()
+
+        torch.manual_seed(3)
+        faster_image, faster_target = faster[0]
+        assert faster_image.shape == (3, 64, 64)
+        boxes = faster_target["boxes"]
+        assert boxes.shape[0] == faster_target["labels"].shape[0]
+        if boxes.numel():
+            assert float(boxes.min()) >= 0.0
+            assert float(boxes.max()) <= 64.0
+            assert (boxes[:, 2] > boxes[:, 0]).all()
+
+        # close_mosaic switches the dataset to the non-mosaic remainder.
+        yolo.set_online_augmentation(strip_mosaic(yolo.online_augmentation))
+        faster.set_online_augmentation(strip_mosaic(faster.online_augmentation))
+        assert yolo.online_augmentation == "hflip+hsv"
+        assert faster.online_augmentation == "hflip+hsv"
+        assert mosaic_component(yolo.online_augmentation) is None
+        torch.manual_seed(5)
+        stripped_image, _ = yolo[0]
+        assert stripped_image.shape == (3, 64, 64)
+        assert torch.isfinite(stripped_image).all()
+
+
+def main() -> None:
     test_flip_targets_match_the_mirrored_image()
     print("flip_target_geometry: passed")
     test_hflip_policy_is_reproducible_and_respects_probability()
@@ -911,6 +988,10 @@ def test_mosaic_datasets_keep_targets_aligned_and_are_reproducible() -> None:
     print("hsv_tensor_contract: passed")
     test_hsv_datasets_preserve_detection_targets()
     print("hsv_dataset_targets: passed")
+    test_augmentation_composition_validates_and_canonicalizes()
+    print("augmentation_composition_contract: passed")
+    test_composed_policy_and_close_mosaic_keep_targets_valid()
+    print("composed_policy_and_close_mosaic: passed")
 
 
 if __name__ == "__main__":
