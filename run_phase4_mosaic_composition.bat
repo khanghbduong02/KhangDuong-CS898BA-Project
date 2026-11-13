@@ -13,7 +13,7 @@ rem least 2 of 3 folds and Spaghetti AP50 must not fall.
 cd /d "%~dp0"
 
 set PYTHON=python
-set DEVICE=0
+set DEVICE=cuda
 set DATA_ROOT=cv-data/roboflow-3d-print-fail-v1
 set YOLO26_ROOT=runs/yolo26/post_submission_letterbox_mosaic_hflip_hsv
 set FRCNN_ROOT=runs/faster_rcnn/post_submission_letterbox_mosaic_hflip_hsv

@@ -7,7 +7,7 @@ rem Re-running this file resumes: completed folds are skipped by the runners.
 cd /d "%~dp0"
 
 set PYTHON=python
-set DEVICE=0
+set DEVICE=cuda
 set DATA_ROOT=cv-data/roboflow-3d-print-fail-v1
 
 echo ===== YOLO11n reference: train folds 1-3 =====
