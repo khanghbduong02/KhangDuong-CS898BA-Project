@@ -831,6 +831,7 @@ def test_mosaic_presets_are_valid_and_ordered() -> None:
     # Each call must be reproducible for a fixed seed.
     img = torch.rand(3, 960, 960)
     lbl = torch.tensor([[0.5, 0.5, 0.5, 0.5, 1.0]])
+    torch.manual_seed(7)
     canvas_a, combined_a = apply_mosaic(
         [img, img, img, img], [lbl, lbl, lbl, lbl], 960, 960,
         probability=1.0, degrees=MOSAIC_PRESETS["mosaic"][0],
@@ -988,6 +989,10 @@ def main() -> None:
     print("hsv_tensor_contract: passed")
     test_hsv_datasets_preserve_detection_targets()
     print("hsv_dataset_targets: passed")
+    test_mosaic_presets_are_valid_and_ordered()
+    print("mosaic_preset_contract: passed")
+    test_mosaic_datasets_keep_targets_aligned_and_are_reproducible()
+    print("mosaic_dataset_alignment: passed")
     test_augmentation_composition_validates_and_canonicalizes()
     print("augmentation_composition_contract: passed")
     test_composed_policy_and_close_mosaic_keep_targets_valid()
