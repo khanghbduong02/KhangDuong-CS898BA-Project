@@ -199,7 +199,7 @@ class YoloDetectionDataset(Dataset):
             if img is None:
                 continue
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img, _ = resize_image(
+            img, extra_transform = resize_image(
                 img, target_height=self.imgsz, target_width=self.imgsz, resize_mode=self.resize_mode,
             )
             img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
@@ -207,11 +207,7 @@ class YoloDetectionDataset(Dataset):
             lp = self.labels_dir / f"{path.stem}.txt"
             lbls = self._load_yolo_labels(lp)
             lbl_t = torch.tensor(lbls, dtype=torch.float32) if lbls else torch.zeros((0, 5), dtype=torch.float32)
-            # Resize-transform the labels into model space (same as primary image).
-            _, extra_transform = resize_image(
-                np.zeros((10, 10, 3), dtype=np.uint8),
-                target_height=self.imgsz, target_width=self.imgsz, resize_mode=self.resize_mode,
-            )
+            # Same geometry the image itself just went through, so aspect and padding match.
             lbl_t = source_yolo_to_model_yolo(lbl_t, extra_transform)
             images.append(img_t)
             targets_list.append(lbl_t)

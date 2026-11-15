@@ -878,6 +878,56 @@ def test_mosaic_datasets_keep_targets_aligned_and_are_reproducible() -> None:
         assert torch.equal(first_image, second_image)
         assert torch.equal(first_labels, second_labels)
 
+def test_mosaic_scales_each_image_into_its_quadrant() -> None:
+    """Each quadrant must hold the whole downscaled image, with boxes scaled to match."""
+    size = 960
+    image = torch.zeros(3, size, size)
+    image[:, 720:960, 720:960] = 1.0  # bright square in the bottom-right quarter
+
+    yolo_labels = torch.tensor([[0.0, 0.875, 0.875, 0.25, 0.25]])
+    torch.manual_seed(11)
+    canvas, combined = apply_mosaic(
+        [image, image, image, image],
+        [yolo_labels, yolo_labels, yolo_labels, yolo_labels],
+        size,
+        size,
+        probability=1.0,
+        degrees=0.0,
+        translate=0.0,
+        scale=0.0,
+        shear=0.0,
+    )
+
+    # Quadrant 0 is the canvas top-left half. The square can only appear in its
+    # bottom-right corner if the whole frame was downscaled instead of cropped.
+    assert canvas[:, 360:480, 360:480].mean() > 0.9
+    assert canvas[:, 0:360, 0:300].mean() < 0.1
+
+    first = combined[0]
+    assert abs(float(first[1]) - 0.4375) < 1e-3
+    assert abs(float(first[2]) - 0.4375) < 1e-3
+    assert abs(float(first[3]) - 0.125) < 1e-3
+    assert abs(float(first[4]) - 0.125) < 1e-3
+
+    # Absolute XYXY boxes must follow the same quadrant scaling.
+    boxes = torch.tensor([[720.0, 720.0, 960.0, 960.0]])
+    torch.manual_seed(11)
+    _, absolute = apply_mosaic(
+        [image, image, image, image],
+        [boxes, boxes, boxes, boxes],
+        size,
+        size,
+        probability=1.0,
+        degrees=0.0,
+        translate=0.0,
+        scale=0.0,
+        shear=0.0,
+    )
+    assert torch.allclose(
+        absolute[0], torch.tensor([360.0, 360.0, 480.0, 480.0]), atol=1e-3
+    )
+
+
 def test_augmentation_composition_validates_and_canonicalizes() -> None:
     """Composed policies must validate, canonicalize, and reject ambiguous families."""
     assert validate_online_augmentation("mosaic+affine+hflip+hsv") == "mosaic+affine+hflip+hsv"
@@ -993,6 +1043,8 @@ def main() -> None:
     print("mosaic_preset_contract: passed")
     test_mosaic_datasets_keep_targets_aligned_and_are_reproducible()
     print("mosaic_dataset_alignment: passed")
+    test_mosaic_scales_each_image_into_its_quadrant()
+    print("mosaic_quadrant_scaling: passed")
     test_augmentation_composition_validates_and_canonicalizes()
     print("augmentation_composition_contract: passed")
     test_composed_policy_and_close_mosaic_keep_targets_valid()

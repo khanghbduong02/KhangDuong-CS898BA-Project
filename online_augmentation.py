@@ -511,9 +511,13 @@ def apply_mosaic(
         # Per-quadrant affine (shared matrix for pixel + box).
         matrix = sample_affine_matrix(half_h, half_w, degrees, translate, scale, shear)
 
-        # Warp the image to the quadrant size.
+        # Downscale the whole image into the quadrant before warping it there.  With
+        # an identity matrix the warp alone copies only the image's top-left quarter,
+        # while the labels below are rescaled to the full frame.
         source = img.detach().to(dtype=torch.float32).permute(1, 2, 0).numpy() * 255.0
         source = np.clip(source, 0, 255).astype(np.uint8)
+        source_height, source_width = source.shape[:2]
+        source = cv2.resize(source, (half_w, half_h), interpolation=cv2.INTER_LINEAR)
         warped = cv2.warpAffine(
             source,
             matrix.numpy()[:2],
@@ -540,7 +544,13 @@ def apply_mosaic(
             half = labels[:, 3:5] * extent / 2.0
             boxes_xyxy = torch.cat([centres - half, centres + half], dim=1)
         else:
-            boxes_xyxy = labels.to(torch.float32)
+            box_scale = torch.tensor(
+                [float(half_w) / float(source_width), float(half_h) / float(source_height)],
+                dtype=torch.float32,
+            )
+            boxes_xyxy = labels.to(torch.float32).clone()
+            boxes_xyxy[:, 0::2] *= box_scale[0]
+            boxes_xyxy[:, 1::2] *= box_scale[1]
 
         transformed, keep = transform_boxes_xyxy(
             boxes_xyxy, matrix, half_h, half_w, MIN_AFFINE_BOX_AREA_FRACTION

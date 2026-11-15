@@ -264,8 +264,11 @@ class FasterRCNNDataset(Dataset):
 
             matrix = sample_affine_matrix(half_h, half_w, degrees, translate, scale, shear)
 
+            # Downscale the whole image into the quadrant, as in apply_mosaic.
             source = img.detach().to(dtype=torch.float32).permute(1, 2, 0).numpy() * 255.0
             source = np.clip(source, 0, 255).astype(np.uint8)
+            source_height, source_width = source.shape[:2]
+            source = cv2.resize(source, (half_w, half_h), interpolation=cv2.INTER_LINEAR)
             warped = cv2.warpAffine(
                 source, matrix.numpy()[:2], (half_w, half_h),
                 flags=cv2.INTER_LINEAR,
@@ -279,8 +282,11 @@ class FasterRCNNDataset(Dataset):
             if boxes.numel() == 0:
                 continue
 
+            quadrant_boxes = boxes.to(torch.float32).clone()
+            quadrant_boxes[:, 0::2] *= float(half_w) / float(source_width)
+            quadrant_boxes[:, 1::2] *= float(half_h) / float(source_height)
             transformed, keep = transform_boxes_xyxy(
-                boxes, matrix, half_h, half_w, MIN_AFFINE_BOX_AREA_FRACTION
+                quadrant_boxes, matrix, half_h, half_w, MIN_AFFINE_BOX_AREA_FRACTION
             )
             shifted = transformed.clone()
             shifted[:, 0] += qx
